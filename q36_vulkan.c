@@ -123,6 +123,10 @@ typedef struct {
     bool subgroup_arithmetic;
     bool subgroup_clustered;
     bool bc250;
+    /* Phoenix APUs (including Radeon 780M) use a different RDNA generation
+     * from the BC-250.  Keep device-specific defaults here rather than
+     * making every generic Vulkan device inherit BC-250 tuning. */
+    bool phoenix;
     uint32_t subgroup_size;
 
     q36_vk_kernel matmul_f16;
@@ -1055,7 +1059,12 @@ static bool q36_vk_use_delta_fast_prefill(void) {
 }
 
 static bool q36_vk_use_delta_col_prefill(void) {
-    return q36_vk_have_subgroups(false) && q36_vk_env_default_on("Q36_VK_DELTA_COL_PREFILL");
+    const char *env = getenv("Q36_VK_DELTA_COL_PREFILL");
+    if (env && env[0]) return env[0] != '0';
+    /* The column/state layout is excellent on the BC-250, but is markedly
+     * slower on Phoenix APUs: its large number of tiny dispatches leaves the
+     * 780M under-occupied.  Keep the override for profiling and new devices. */
+    return q36_vk_have_subgroups(false) && !q36_vk.phoenix;
 }
 
 static bool q36_vk_use_delta_decode(void) {
@@ -2743,6 +2752,10 @@ int q36_gpu_init(void) {
     q36_vk.subgroup_clustered =
         (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT) != 0;
     q36_vk.bc250 = q36_vk.props.vendorID == 0x1002u && q36_vk.props.deviceID == 0x13feu;
+    /* AMD Phoenix integrated graphics use device 0x1900 (Radeon 780M and
+     * related Phoenix APUs).  This is deliberately a narrow match: other
+     * generic Vulkan devices retain the existing feature-based defaults. */
+    q36_vk.phoenix = q36_vk.props.vendorID == 0x1002u && q36_vk.props.deviceID == 0x1900u;
 #ifdef Q36_VULKAN_REQUIRE_BC250
     if (!q36_vk.bc250) {
         fprintf(stderr, "q36: this vulkan-bc250 build requires an AMD BC-250 (1002:13fe)\n");
@@ -2762,8 +2775,9 @@ int q36_gpu_init(void) {
     } else {
         fprintf(stderr, "q36: Vulkan device %s\n", q36_vk.props.deviceName);
     }
-    fprintf(stderr, "q36: Vulkan generic backend%s, subgroup %u\n",
-            q36_vk.bc250 ? ", BC-250 fast path" : "", q36_vk.subgroup_size);
+    fprintf(stderr, "q36: Vulkan generic backend%s%s, subgroup %u\n",
+            q36_vk.bc250 ? ", BC-250 fast path" : "",
+            q36_vk.phoenix ? ", Phoenix tuning" : "", q36_vk.subgroup_size);
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {
