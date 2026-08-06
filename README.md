@@ -2,6 +2,136 @@
   <img src="logo.svg" alt="QuarkStar logo" width="220">
 </p>
 
+# QuarkStar — Radeon 780M / GFX1103 branch
+
+> **Hardware-specific branch:** `q36-phoenix` is tuned for AMD Phoenix APUs,
+> especially the Radeon 780M (`GFX1103`, Vulkan device `1002:1900`). It is not
+> intended to replace the upstream BC-250-tuned Vulkan configuration.
+
+## Phoenix branch
+
+This fork keeps the Q36 model-specific Vulkan inference engine, but changes the
+runtime defaults for Radeon 780M-class hardware. The original Vulkan fast paths
+were developed primarily for the AMD BC-250; profiling on Phoenix showed that
+its `delta_net_cols` prefill kernel was substantially slower on the 780M. This
+branch detects Phoenix and disables that kernel by default while retaining all
+other validated optimized paths.
+
+### Hardware/software target
+
+- AMD Radeon 780M integrated graphics / Phoenix APU (`GFX1103`)
+- Linux with Mesa RADV and Vulkan 1.1+
+- 64-lane Vulkan subgroups
+- Approximately 16 GiB unified system/GPU memory
+- Leave room for the KV cache and operating system
+
+Verify the active device before benchmarking:
+
+```sh
+vulkaninfo --summary
+```
+
+The expected Vulkan device is `AMD Radeon 780M Graphics (RADV PHOENIX)` with
+`driverName: radv`. Do not use the llvmpipe Vulkan device.
+
+### Build and run
+
+```sh
+make -j"$(nproc)"
+./q36 --vulkan -p "Explain radix trees."
+```
+
+The startup banner should contain:
+
+```text
+q36: Vulkan generic backend, Phoenix tuning, subgroup 64
+```
+
+Use the resident Q2 model supplied by this repository. The mixed Q2/Q4 model
+requires SSD streaming and has a significantly different performance profile.
+
+### Branch-specific tuning
+
+Phoenix tuning is selected automatically from Vulkan vendor/device ID
+`1002:1900`. The affected kernel can still be controlled for experiments:
+
+```sh
+Q36_VK_DELTA_COL_PREFILL=0 ./q36-bench --vulkan ... # Phoenix default
+Q36_VK_DELTA_COL_PREFILL=1 ./q36-bench --vulkan ... # force the old path
+```
+
+The BC-250 behavior and other generic Vulkan devices remain unchanged.
+
+### Measured performance
+
+Using `q36-bench`, the current Radeon 780M results were approximately:
+
+| Context | Prefill | Decode |
+|---:|---:|---:|
+| 512 | 232 t/s | 24.7 t/s |
+| 1024 | 252 t/s | 24.7 t/s |
+| 3072 | 200 t/s | 24.1 t/s |
+| 4096 | 159 t/s | 24.0 t/s |
+
+These are Q36-specific measurements, not a general Vulkan or llama.cpp
+benchmark. Results depend on the exact GGUF, prompt, KV precision, context,
+RADV version, memory pressure, and GPU power policy.
+
+For repeatable measurements:
+
+```sh
+./q36-bench --vulkan \
+  --prompt-file tests/long_context_story_prompt.txt \
+  --ctx-start 1024 --ctx-max 4096 \
+  --step-incr 1024 --gen-tokens 8
+```
+
+For profiling:
+
+```sh
+Q36_VK_PROF_KERNEL=1 ./q36-bench --vulkan \
+  --prompt-file tests/long_context_story_prompt.txt \
+  --ctx-start 4096 --ctx-max 4096 --gen-tokens 8
+```
+
+### GPU clocks
+
+`pp_dpm_sclk` lists available clock states; it does not necessarily show the
+current clock. Read the live frequency in Hz with:
+
+```sh
+cat /sys/class/drm/card1/device/hwmon/hwmon3/freq1_input
+```
+
+For temporary performance testing:
+
+```sh
+sudo sh -c 'echo high > /sys/class/drm/card1/device/power_dpm_force_performance_level'
+# run benchmark
+sudo sh -c 'echo auto > /sys/class/drm/card1/device/power_dpm_force_performance_level'
+```
+
+Use the appropriate `cardN`/`hwmonN` paths if the system numbers devices
+differently. Sustained high clocks require adequate cooling and power delivery.
+
+### Current limitations and future work
+
+The largest remaining profiled costs are the long-context attention prefill
+kernel (`attn_prefill_qtile2`), routed MoE GEMMs, and recurrent decode work.
+Potential future Phoenix-specific work includes:
+
+- A Radeon 780M attention shader with Phoenix-specific tiling and barriers
+- MoE GEMM workgroup and expert-tile tuning
+- Reduced Vulkan command submission and synchronization overhead
+- More extensible device tuning profiles instead of a single device-ID match
+- Direct apples-to-apples comparison with llama.cpp using identical prompts,
+  model, KV types, context, and power settings
+
+See [`OPTIMIZATION_RADEON_780M.md`](OPTIMIZATION_RADEON_780M.md) for the full
+optimization history and profiling notes.
+
+---
+
 **QuarkStar** is a small native inference engine for **Qwen3.6-35B-A3B** and
 **KAT-Coder-V2.5-Dev**.
 It is self-contained and deliberately narrow, not a general GGUF runner. 
