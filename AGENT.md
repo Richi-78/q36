@@ -2,6 +2,7 @@
 
 `q36.c` is a Qwen3.6-35B-A3B specific inference engine. It is not a generic
 GGUF runner. The goal is a small, readable, high-performance C codebase.
+new branch "q36/tree/q36-phoenix is psecific for Radeon 780M GFX (codename gfx1103)
 
 ## Goals
 
@@ -47,12 +48,19 @@ GGUF runner. The goal is a small, readable, high-performance C codebase.
 
 ## Hardware Targets
 
-- AMD BC-250 (RDNA 2, 24 CUs / 1536 shaders, 16 GB unified GDDR6) via
-  Vulkan/RADV on Linux. Codename "Cyan Skillfish", cut-down PS5 APU.
-- Unified memory, ~10-14 GB usable for the model after OS and KV cache.
-- Weight buffers map directly from GGUF with no copy via
-  VK_EXT_external_memory_host. No staging-buffer path.
-- Q2 routed-expert quant only. The memory budget is too tight for Q4.
+### AMD Radeon 780M (RDNA 3, 12 CUs / 768 shaders, shared memory, tipically DDR5)
+    Specific branch at https://github.com/Richi-78/q36/tree/q36-phoenix
+    Via Vulkan/RADV on Linux
+    - Options for Q2 and possibly Q4 for systemns with 32GB RAM (24GB assigned via 
+      amdgpu.gttsize and ttm.pages_limit GRUB options 
+      (as suggested in https://github.com/kyuz0/amd-strix-halo-toolboxes#host-configuration)
+
+### AMD BC-250 (RDNA 2, 24 CUs / 1536 shaders, 16 GB unified GDDR6) via
+    Vulkan/RADV on Linux. Codename "Cyan Skillfish", cut-down PS5 APU. 
+    - Unified memory, ~10-14 GB usable for the model after OS and KV cache.
+    - Weight buffers map directly from GGUF with no copy via
+      VK_EXT_external_memory_host. No staging-buffer path.
+    - Q2 routed-expert quant only. The memory budget is too tight for Q4.
 
 ## Testing
 
