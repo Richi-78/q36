@@ -1,0 +1,156 @@
+; cm_kernel.spvasm - minimal VK_KHR_cooperative_matrix probe.
+;
+; C[16][16] = A[16][16] * B[16][16]; f16 inputs, f32 accumulation,
+; scope = subgroup.  Local size 64 = one subgroup.
+; All matrix traffic goes through shared memory as contiguous row-major
+; f16 slabs with default stride (RDNA3/MFMA friendly path).
+;
+; bindings:
+;   set 0 binding 0: A f16[256]   (readonly)
+;   set 0 binding 1: B f16[256]   (readonly)
+;   set 0 binding 2: OUT f32[256] (writeonly)
+; push constants: none.
+
+               OpCapability Shader
+               OpCapability Float16
+               OpCapability CooperativeMatrixKHR
+               OpCapability VulkanMemoryModel
+               OpExtension "SPV_KHR_cooperative_matrix"
+               OpMemoryModel Logical VulkanKHR
+               OpEntryPoint GLCompute %main "main" %gl_local %var_a %var_b %var_o %var_as %var_bs %var_cs
+               OpExecutionMode %main LocalSize 64 1 1
+; ---------------- decorations ----------------
+    OpDecorate %var_a DescriptorSet 0
+    OpDecorate %var_a Binding 0
+    OpDecorate %var_a NonWritable
+    OpDecorate %var_b DescriptorSet 0
+    OpDecorate %var_b Binding 1
+    OpDecorate %var_b NonWritable
+    OpDecorate %var_o DescriptorSet 0
+    OpDecorate %var_o Binding 2
+    OpDecorate %t_rt16 ArrayStride 2
+    OpDecorate %t_rt32 ArrayStride 4
+    OpDecorate %t_sb16 Block
+    OpDecorate %t_sb32 Block
+    OpMemberDecorate %t_sb16 0 Offset 0
+    OpMemberDecorate %t_sb32 0 Offset 0
+    OpDecorate %gl_local BuiltIn LocalInvocationId
+
+
+; ---------------- types, constants, vars (topological order) ----------------
+       %void = OpTypeVoid
+    %void_fn = OpTypeFunction %void
+        %i32 = OpTypeInt 32 1
+        %u32 = OpTypeInt 32 0
+        %f32 = OpTypeFloat 32
+        %f16 = OpTypeFloat 16
+      %v3u32 = OpTypeVector %u32 3
+       %bool = OpTypeBool
+       %c0 = OpConstant %u32 0
+      %c64 = OpConstant %u32 64
+     %c256 = OpConstant %u32 256
+      %c16 = OpConstant %u32 16
+     %fz32 = OpConstant %f32 0
+  %scope_sub = OpConstant %i32 3
+ %scope_wg_i = OpConstant %i32 2
+    %use_a  = OpConstant %i32 0
+    %use_b  = OpConstant %i32 1
+    %use_acc = OpConstant %i32 2
+%mem_ar     = OpConstant %u32 24840  ; AcqRel|WorkgroupMem|Avail|Visible  ; AcqRel|MakeAvailable|MakeVisible     ; Acq|Rel|MakeAvailable|MakeVisible
+%layout_rm  = OpConstant %u32 0
+%stride16   = OpConstant %u32 16
+%p_input_v3 = OpTypePointer Input %v3u32
+%p_s16      = OpTypePointer StorageBuffer %f16
+%p_s32      = OpTypePointer StorageBuffer %f32
+ %t_rt16    = OpTypeRuntimeArray %f16
+ %t_rt32    = OpTypeRuntimeArray %f32
+ %t_sb16    = OpTypeStruct %t_rt16
+ %t_sb32    = OpTypeStruct %t_rt32
+%p_struct16 = OpTypePointer StorageBuffer %t_sb16
+%p_struct32 = OpTypePointer StorageBuffer %t_sb32
+ %p_w16     = OpTypePointer Workgroup %f16
+ %p_w32     = OpTypePointer Workgroup %f32
+ %t_as      = OpTypeArray %f16 %c256
+ %t_bs      = OpTypeArray %f16 %c256
+ %t_cs      = OpTypeArray %f32 %c256
+ %p_as      = OpTypePointer Workgroup %t_as
+ %p_bs      = OpTypePointer Workgroup %t_bs
+ %p_cs      = OpTypePointer Workgroup %t_cs
+ %cm_ty_a  = OpTypeCooperativeMatrixKHR %f16 %scope_sub %c16 %c16 %use_a
+ %cm_ty_b  = OpTypeCooperativeMatrixKHR %f16 %scope_sub %c16 %c16 %use_b
+ %cm_ty_c  = OpTypeCooperativeMatrixKHR %f32 %scope_sub %c16 %c16 %use_acc
+; ---------------- variables ----------------
+ %gl_local = OpVariable %p_input_v3 Input
+   %var_a  = OpVariable %p_struct16 StorageBuffer
+   %var_b  = OpVariable %p_struct16 StorageBuffer
+   %var_o  = OpVariable %p_struct32 StorageBuffer
+   %var_as = OpVariable %p_as Workgroup
+   %var_bs = OpVariable %p_bs Workgroup
+   %var_cs = OpVariable %p_cs Workgroup
+; ---------------- main ----------------
+    %main = OpFunction %void None %void_fn
+    %en1  = OpLabel
+   %lid   = OpLoad %v3u32 %gl_local
+   %tid   = OpCompositeExtract %u32 %lid 0
+
+; --------- stage A: global -> shared ----------
+   OpBranch %a_head
+  %a_head = OpLabel
+   %a_i   = OpPhi %u32 %tid %en1 %a_nx %a_body
+   %a_lt  = OpULessThan %bool %a_i %c256
+   OpLoopMerge %a_done %a_body None
+   OpBranchConditional %a_lt %a_body %a_done
+  %a_body = OpLabel
+   %a_sc  = OpAccessChain %p_s16 %var_a %c0 %a_i
+   %a_v   = OpLoad %f16 %a_sc
+   %a_dc  = OpAccessChain %p_w16 %var_as %a_i
+   OpStore %a_dc %a_v
+   %a_nx  = OpIAdd %u32 %a_i %c64
+   OpBranch %a_head
+  %a_done = OpLabel
+
+; ---------- stage B: global -> shared ----------
+   OpBranch %b_head
+  %b_head = OpLabel
+   %b_i   = OpPhi %u32 %tid %a_done %b_nx %b_body
+   %b_lt  = OpULessThan %bool %b_i %c256
+   OpLoopMerge %b_done %b_body None
+   OpBranchConditional %b_lt %b_body %b_done
+  %b_body = OpLabel
+   %b_sc  = OpAccessChain %p_s16 %var_b %c0 %b_i
+   %var_bal = OpLoad %f16 %b_sc
+   %b_dc  = OpAccessChain %p_w16 %var_bs %b_i
+   OpStore %b_dc %var_bal
+   %b_nx  = OpIAdd %u32 %b_i %c64
+   OpBranch %b_head
+  %b_done = OpLabel
+   OpControlBarrier %scope_wg_i %scope_wg_i %mem_ar
+
+; ---------- cooperative multiply: C = A * B ----------
+   %pa    = OpAccessChain %p_w16 %var_as %c0
+   %ma    = OpCooperativeMatrixLoadKHR %cm_ty_a %pa %layout_rm %stride16
+   %pb    = OpAccessChain %p_w16 %var_bs %c0
+   %mb    = OpCooperativeMatrixLoadKHR %cm_ty_b %pb %layout_rm %stride16
+   %mz    = OpCompositeConstruct %cm_ty_c %fz32
+   %mc    = OpCooperativeMatrixMulAddKHR %cm_ty_c %ma %mb %mz
+   %pc    = OpAccessChain %p_w32 %var_cs %c0
+   OpCooperativeMatrixStoreKHR %pc %mc %layout_rm %stride16
+   OpControlBarrier %scope_wg_i %scope_wg_i %mem_ar
+
+; ---------- copy C: shared -> global ----------
+   OpBranch %o_head
+  %o_head = OpLabel
+   %o_i   = OpPhi %u32 %tid %b_done %o_nx %o_body
+   %o_lt  = OpULessThan %bool %o_i %c256
+   OpLoopMerge %o_done %o_body None
+   OpBranchConditional %o_lt %o_body %o_done
+  %o_body = OpLabel
+   %o_sc  = OpAccessChain %p_w32 %var_cs %o_i
+   %o_val = OpLoad %f32 %o_sc
+   %o_dc  = OpAccessChain %p_s32 %var_o %c0 %o_i
+   OpStore %o_dc %o_val
+   %o_nx  = OpIAdd %u32 %o_i %c64
+   OpBranch %o_head
+  %o_done = OpLabel
+   OpReturn
+           OpFunctionEnd

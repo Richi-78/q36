@@ -1,0 +1,378 @@
+; matmul_q8_0_mm_f16_cm.spvasm
+;
+; Q8_0 prefill GEMM using VK_KHR_cooperative_matrix (16x16x16 F16xF16->F32,
+; scope subgroup) - Radeon 780M / Phoenix prototype.
+;
+; Contract identical to matmul_q8_0_mm_f16:
+;   set 0 binding 0: weights, uint16[out_dim * blocks * 17]
+;                        block b of (row) is at words (row*blocks + b)*17:
+;                        [d f16][32 int8 qs packed as 16 u16]
+;   set 0 binding 1: x     f32[n_tok * in_dim],  in_dim = blocks*32
+;   set 0 binding 2: out   f32[n_tok * out_dim]
+;   push (20 B): out_dim u32 at 0, n_tok u32 at 4, blocks u32 at 8,
+;                row_bytes u32 at 12, scale f32 at 16
+;   dispatch: gx = ceil(out_dim/32), gy = ceil(n_tok/64)
+;   workgroup 128 threads; tile 32 rows x 64 cols; k step = 16.
+;
+; RADV Phoenix currently executes only the first two cooperative-matrix
+; subgroups reliably in a 256-invocation workgroup. Keeping this tile to two
+; subgroups is intentional: the old four-subgroup version silently returned
+; zero for rows 64..127. The smaller tile is still a valid MFMA path and
+; handles arbitrary dimensions through the bounds checks below.
+;
+; Numerics: A stages as f32(q)*f32(d) rounded once to f16, B rounds f32
+; activations to f16 once, and the cooperative multiply accumulates in f32
+; across the whole k dimension.  The scale is folded into A before its f16
+; conversion, so this is intentionally approximate like the packed-f16
+; baseline rather than a quality/bit-exact path. The result is scaled by
+; pc.scale when written.
+
+               OpCapability Shader
+               OpCapability Float16
+               OpCapability Int16
+               OpCapability StorageBuffer16BitAccess
+               OpCapability CooperativeMatrixKHR
+               OpCapability VulkanMemoryModel
+               OpExtension "SPV_KHR_cooperative_matrix"
+               OpMemoryModel Logical VulkanKHR
+               OpEntryPoint GLCompute %main "main" %gid %glid %var_w %var_x %var_y %var_pc %var_as %var_bs %var_cs
+               OpExecutionMode %main LocalSize 128 1 1
+
+; ---------------- decorations ----------------
+    OpDecorate %var_w DescriptorSet 0
+    OpDecorate %var_w Binding 0
+    OpDecorate %var_w NonWritable
+    OpDecorate %var_x DescriptorSet 0
+    OpDecorate %var_x Binding 1
+    OpDecorate %var_x NonWritable
+    OpDecorate %var_y DescriptorSet 0
+    OpDecorate %var_y Binding 2
+    OpDecorate %t_sb16 Block
+    OpDecorate %t_sb32 Block
+    OpMemberDecorate %t_sb16 0 Offset 0
+    OpMemberDecorate %t_sb32 0 Offset 0
+    OpDecorate %t_rt16 ArrayStride 2
+    OpDecorate %t_rt32 ArrayStride 4
+    OpDecorate %spush Block
+    OpMemberDecorate %spush 0 Offset 0
+    OpMemberDecorate %spush 1 Offset 4
+    OpMemberDecorate %spush 2 Offset 8
+    OpMemberDecorate %spush 3 Offset 12
+    OpMemberDecorate %spush 4 Offset 16
+    OpDecorate %gid     BuiltIn WorkgroupId
+    OpDecorate %glid    BuiltIn LocalInvocationId
+
+; ---------------- base types ----------------
+       %void = OpTypeVoid
+    %void_fn = OpTypeFunction %void
+        %i32 = OpTypeInt 32 1
+        %u32 = OpTypeInt 32 0
+        %f32 = OpTypeFloat 32
+        %f16 = OpTypeFloat 16
+        %u16 = OpTypeInt 16 0
+      %v3u32 = OpTypeVector %u32 3
+       %bool = OpTypeBool
+
+; ---------------- constants ----------------
+       %c0u = OpConstant %u32 0
+       %c1u = OpConstant %u32 1
+       %c2u = OpConstant %u32 2
+       %c10u = OpConstant %u32 10
+       %c3u = OpConstant %u32 3
+       %c4u = OpConstant %u32 4
+       %c6u = OpConstant %u32 6
+       %c8u = OpConstant %u32 8
+      %c15u = OpConstant %u32 15
+      %c16u = OpConstant %u32 16
+      %c17u = OpConstant %u32 17
+      %c24u = OpConstant %u32 24
+      %c32u = OpConstant %u32 32
+      %c64u = OpConstant %u32 64
+     %c128u = OpConstant %u32 128
+     %c255u = OpConstant %u32 255
+     %c256u = OpConstant %u32 256
+     %c512u = OpConstant %u32 512
+     %c768u = OpConstant %u32 768
+    %c1024u = OpConstant %u32 1024
+    %c2048u = OpConstant %u32 2048
+    %c4096u = OpConstant %u32 4096
+   %f128inv = OpConstant %f32 0.0078125
+      %f128 = OpConstant %f32 128.0
+      %fz32 = OpConstant %f32 0
+  %scope_sub = OpConstant %i32 3
+ %scope_wg_i = OpConstant %i32 2
+    %use_a   = OpConstant %i32 0
+    %use_b   = OpConstant %i32 1
+    %use_acc = OpConstant %i32 2
+ %layout_rm  = OpConstant %u32 0
+  %stride16  = OpConstant %u32 16
+%mem_sem     = OpConstant %u32 24840
+
+; ---------------- pointer types ----------------
+%p_in_v3    = OpTypePointer Input %v3u32
+%p_s16      = OpTypePointer StorageBuffer %u16
+%p_s32      = OpTypePointer StorageBuffer %f32
+%p_u32      = OpTypePointer PushConstant %u32
+%p_f32pc    = OpTypePointer PushConstant %f32
+ %t_rt16    = OpTypeRuntimeArray %u16
+ %t_rt32    = OpTypeRuntimeArray %f32
+ %t_sb16    = OpTypeStruct %t_rt16
+ %t_sb32    = OpTypeStruct %t_rt32
+%p_sb16     = OpTypePointer StorageBuffer %t_sb16
+%p_sb32     = OpTypePointer StorageBuffer %t_sb32
+%p_w16      = OpTypePointer Workgroup %f16
+%p_w32      = OpTypePointer Workgroup %f32
+%t_as       = OpTypeArray %f16 %c512u
+%t_bs       = OpTypeArray %f16 %c1024u
+%t_cs       = OpTypeArray %f32 %c2048u
+%p_as       = OpTypePointer Workgroup %t_as
+%p_bs       = OpTypePointer Workgroup %t_bs
+%p_cs       = OpTypePointer Workgroup %t_cs
+ %spush     = OpTypeStruct %u32 %u32 %u32 %u32 %f32
+%p_spush    = OpTypePointer PushConstant %spush
+%p_push_u32 = OpTypePointer PushConstant %u32
+
+; ---------------- cooperative matrix types ----------------
+ %cm_ty_a  = OpTypeCooperativeMatrixKHR %f16 %scope_sub %c16u %c16u %use_a
+ %cm_ty_b  = OpTypeCooperativeMatrixKHR %f16 %scope_sub %c16u %c16u %use_b
+ %cm_ty_c  = OpTypeCooperativeMatrixKHR %f32 %scope_sub %c16u %c16u %use_acc
+
+; ---------------- variables ----------------
+   %gid    = OpVariable %p_in_v3 Input
+   %glid   = OpVariable %p_in_v3 Input
+   %var_w  = OpVariable %p_sb16 StorageBuffer
+   %var_x  = OpVariable %p_sb32 StorageBuffer
+   %var_y  = OpVariable %p_sb32 StorageBuffer
+   %var_pc = OpVariable %p_spush PushConstant
+   %var_as = OpVariable %p_as Workgroup
+   %var_bs = OpVariable %p_bs Workgroup
+   %var_cs = OpVariable %p_cs Workgroup
+
+; ---------------- entry point interface ----------------
+
+; ---------------- main ----------------
+ %main = OpFunction %void None %void_fn
+   %en  = OpLabel
+
+   %p_out  = OpAccessChain %p_u32 %var_pc %c0u
+   %outdim = OpLoad %u32 %p_out
+   %p_tok  = OpAccessChain %p_u32 %var_pc %c1u
+   %ntok   = OpLoad %u32 %p_tok
+   %p_blk  = OpAccessChain %p_u32 %var_pc %c2u
+   %blocks = OpLoad %u32 %p_blk
+   %p_sc   = OpAccessChain %p_f32pc %var_pc %c4u
+   %scale  = OpLoad %f32 %p_sc
+
+   %wid    = OpLoad %v3u32 %gid
+   %gxw    = OpCompositeExtract %u32 %wid 0
+   %gyw    = OpCompositeExtract %u32 %wid 1
+   %loc    = OpLoad %v3u32 %glid
+   %tid    = OpCompositeExtract %u32 %loc 0
+   %row0   = OpIMul %u32 %gxw %c32u
+   %col0   = OpIMul %u32 %gyw %c64u
+   %in_dim = OpIMul %u32 %blocks %c32u
+   %warp   = OpShiftRightLogical %u32 %tid %c6u
+   %mzero  = OpCompositeConstruct %cm_ty_c %fz32
+   ; A Q8_0 block has 32 values, while the cooperative K tile is 16.
+   ; One loop iteration handles one half-block.
+   %kcount = OpIMul %u32 %blocks %c2u
+
+; ---------------- k loop ----------------
+   OpBranch %k_head
+ %k_head = OpLabel
+   %kb    = OpPhi %u32 %c0u %en %kb_nx %k_cont
+   %ka0   = OpPhi %cm_ty_c %mzero %en %ma0 %k_cont
+   %ka1   = OpPhi %cm_ty_c %mzero %en %ma1 %k_cont
+   %ka2   = OpPhi %cm_ty_c %mzero %en %ma2 %k_cont
+   %ka3   = OpPhi %cm_ty_c %mzero %en %ma3 %k_cont
+   %kblt  = OpULessThan %bool %kb %kcount
+   OpLoopMerge %kdone %k_cont None
+   OpBranchConditional %kblt %kbody %kdone
+
+ %kbody = OpLabel
+   ; ---------- stage A: A_sh[128][16], 8 elems/thread ----------
+   OpBranch %aloop
+ %aloop = OpLabel
+   %iA   = OpPhi %u32 %c0u %kbody %iA_n %alatch
+   %aLT  = OpULessThan %bool %iA %c8u
+   OpLoopMerge %adone %alatch None
+   OpBranchConditional %aLT %abody %adone
+ %abody = OpLabel
+   %iA256 = OpIMul %u32 %iA %c128u
+   %eA    = OpIAdd %u32 %iA256 %tid
+   %ar    = OpShiftRightLogical %u32 %eA %c4u
+   %ac    = OpBitwiseAnd %u32 %eA %c15u
+   %rowg  = OpIAdd %u32 %row0 %ar
+   %rOk   = OpULessThan %bool %rowg %outdim
+   %rl    = OpSelect %u32 %rOk %rowg %c0u
+   %kbk   = OpShiftRightLogical %u32 %kb %c1u
+   %kbh   = OpBitwiseAnd %u32 %kb %c1u
+   %wb1   = OpIMul %u32 %rl %blocks
+   %wb2   = OpIAdd %u32 %wb1 %kbk
+   %wb3   = OpIMul %u32 %wb2 %c17u
+   %pd    = OpAccessChain %p_s16 %var_w %c0u %wb3
+   %d16b  = OpLoad %u16 %pd
+   %d16   = OpBitcast %f16 %d16b
+   %d32r  = OpFConvert %f32 %d16
+   %d32   = OpFMul %f32 %d32r %f128
+   %h16   = OpIMul %u32 %kbh %c16u
+   %byte  = OpIAdd %u32 %h16 %ac
+   %wq    = OpShiftRightLogical %u32 %byte %c1u
+   %wq1   = OpIAdd %u32 %wb3 %c1u
+   %wqi   = OpIAdd %u32 %wq1 %wq
+   %pq    = OpAccessChain %p_s16 %var_w %c0u %wqi
+   %q16   = OpLoad %u16 %pq
+   %bv    = OpUConvert %u32 %q16
+   %bsb   = OpBitwiseAnd %u32 %byte %c1u
+   %bevn  = OpIEqual %bool %bsb %c0u
+   %blo   = OpBitwiseAnd %u32 %bv %c255u
+   %bhi   = OpShiftRightLogical %u32 %bv %c8u
+   %b8    = OpSelect %u32 %bevn %blo %bhi
+   %lx    = OpBitwiseAnd %u32 %b8 %c255u
+   %l24   = OpShiftLeftLogical %u32 %lx %c24u
+   %is    = OpBitcast %i32 %l24
+   %sx    = OpShiftRightArithmetic %i32 %is %c24u
+   %qf    = OpConvertSToF %f32 %sx
+   %dq    = OpFMul %f32 %qf %d32
+   %dq2   = OpFMul %f32 %dq %f128inv
+   %af16  = OpFConvert %f16 %dq2
+   %ain   = OpIMul %u32 %ar %c16u
+   %aii   = OpIAdd %u32 %ain %ac
+   %pAd   = OpAccessChain %p_w16 %var_as %aii
+   OpStore %pAd %af16
+   OpBranch %alatch
+ %alatch = OpLabel
+   %iA_n  = OpIAdd %u32 %iA %c1u
+   OpBranch %aloop
+ %adone = OpLabel
+   ; ---------- stage B: B_sh[4][16][16] from x ----------
+   OpBranch %bloop
+ %bloop = OpLabel
+   %iB   = OpPhi %u32 %c0u %adone %iB_n %blatch
+   %bLt  = OpULessThan %bool %iB %c8u
+   OpLoopMerge %bdone %blatch None
+   OpBranchConditional %bLt %bbody %bdone
+ %bbody = OpLabel
+   %iB256 = OpIMul %u32 %iB %c128u
+   %eB    = OpIAdd %u32 %iB256 %tid
+   %slab  = OpShiftRightLogical %u32 %eB %c8u
+   %bk8   = OpShiftRightLogical %u32 %eB %c4u
+   %bk    = OpBitwiseAnd %u32 %bk8 %c15u
+   %bn    = OpBitwiseAnd %u32 %eB %c15u
+   %bslot = OpIMul %u32 %slab %c16u
+   %btok  = OpIAdd %u32 %col0 %bn
+   %btok2 = OpIAdd %u32 %btok %bslot
+   %bTok  = OpULessThan %bool %btok2 %ntok
+   %bt    = OpSelect %u32 %bTok %btok2 %c0u
+   %bkb   = OpIMul %u32 %kb %c16u
+   %bkg   = OpIAdd %u32 %bkb %bk
+   %xrow  = OpIMul %u32 %bt %in_dim
+   %xidx  = OpIAdd %u32 %xrow %bkg
+   %px    = OpAccessChain %p_s32 %var_x %c0u %xidx
+   %xval  = OpLoad %f32 %px
+   %x16   = OpFConvert %f16 %xval
+   %bo1   = OpIMul %u32 %slab %c256u
+   %bo2   = OpIMul %u32 %bk %c16u
+   %bo3   = OpIAdd %u32 %bo1 %bo2
+   %bo    = OpIAdd %u32 %bo3 %bn
+   %pBd   = OpAccessChain %p_w16 %var_bs %bo
+   OpStore %pBd %x16
+   OpBranch %blatch
+ %blatch = OpLabel
+   %iB_n  = OpIAdd %u32 %iB %c1u
+   OpBranch %bloop
+ %bdone = OpLabel
+   OpControlBarrier %scope_wg_i %scope_wg_i %mem_sem
+
+   ; ---------- cooperative matmul, warp-private accumulators ----------
+   %aoff  = OpIMul %u32 %warp %c256u
+   %pa    = OpAccessChain %p_w16 %var_as %aoff
+   %ma    = OpCooperativeMatrixLoadKHR %cm_ty_a %pa %layout_rm %stride16
+   %pb0   = OpAccessChain %p_w16 %var_bs %c0u
+   %mb0   = OpCooperativeMatrixLoadKHR %cm_ty_b %pb0 %layout_rm %stride16
+   %pb1   = OpAccessChain %p_w16 %var_bs %c256u
+   %mb1   = OpCooperativeMatrixLoadKHR %cm_ty_b %pb1 %layout_rm %stride16
+   %pb2   = OpAccessChain %p_w16 %var_bs %c512u
+   %mb2   = OpCooperativeMatrixLoadKHR %cm_ty_b %pb2 %layout_rm %stride16
+   %pb3   = OpAccessChain %p_w16 %var_bs %c768u
+   %mb3   = OpCooperativeMatrixLoadKHR %cm_ty_b %pb3 %layout_rm %stride16
+   %ma0   = OpCooperativeMatrixMulAddKHR %cm_ty_c %ma %mb0 %ka0
+   %ma1   = OpCooperativeMatrixMulAddKHR %cm_ty_c %ma %mb1 %ka1
+   %ma2   = OpCooperativeMatrixMulAddKHR %cm_ty_c %ma %mb2 %ka2
+   %ma3   = OpCooperativeMatrixMulAddKHR %cm_ty_c %ma %mb3 %ka3
+   ; Do not let a fast subgroup overwrite A_sh/B_sh while another subgroup
+   ; is still consuming this k-block.
+   OpControlBarrier %scope_wg_i %scope_wg_i %mem_sem
+   OpBranch %k_cont
+
+ %k_cont = OpLabel
+   %kb_nx = OpIAdd %u32 %kb %c1u
+   OpBranch %k_head
+
+ %kdone = OpLabel
+   ; ---------- spill accumulators, write y ----------
+   %cbase = OpIMul %u32 %warp %c1024u
+   %co0   = OpIAdd %u32 %cbase %c0u
+   %pc0   = OpAccessChain %p_w32 %var_cs %co0
+   OpCooperativeMatrixStoreKHR %pc0 %ka0 %layout_rm %stride16
+   %co1   = OpIAdd %u32 %cbase %c256u
+   %pc1   = OpAccessChain %p_w32 %var_cs %co1
+   OpCooperativeMatrixStoreKHR %pc1 %ka1 %layout_rm %stride16
+   %co2   = OpIAdd %u32 %cbase %c512u
+   %pc2   = OpAccessChain %p_w32 %var_cs %co2
+   OpCooperativeMatrixStoreKHR %pc2 %ka2 %layout_rm %stride16
+   %co3   = OpIAdd %u32 %cbase %c768u
+   %pc3   = OpAccessChain %p_w32 %var_cs %co3
+   OpCooperativeMatrixStoreKHR %pc3 %ka3 %layout_rm %stride16
+   OpControlBarrier %scope_wg_i %scope_wg_i %mem_sem
+
+   ; Each of the 256 threads owns one contiguous 16-element slice.
+   OpBranch %wloop
+ %wloop = OpLabel
+   %iW    = OpPhi %u32 %c0u %kdone %iW_n %wlatch
+   %wLt   = OpULessThan %bool %iW %c16u
+   OpLoopMerge %wdone %wlatch None
+   OpBranchConditional %wLt %wbody %wdone
+ %wbody = OpLabel
+   %eW16  = OpIMul %u32 %iW %c128u
+   %eW    = OpIAdd %u32 %eW16 %tid
+   %ww    = OpShiftRightLogical %u32 %eW %c10u      ; warp index 0..3
+   %tj     = OpShiftRightLogical %u32 %eW %c8u
+   %td    = OpBitwiseAnd %u32 %tj %c3u             ; col block 0..3
+   %tm    = OpShiftRightLogical %u32 %eW %c4u
+   %tm2   = OpBitwiseAnd %u32 %tm %c15u            ; row in block
+   %tn    = OpBitwiseAnd %u32 %eW %c15u            ; col in block
+   %cs1   = OpIMul %u32 %ww %c1024u
+   %cs2   = OpIMul %u32 %td %c256u
+   %cs3   = OpIAdd %u32 %cs1 %cs2
+   %cs4   = OpIMul %u32 %tm2 %c16u
+   %cofs  = OpIAdd %u32 %cs3 %cs4
+   %cof   = OpIAdd %u32 %cofs %tn
+   %cp    = OpAccessChain %p_w32 %var_cs %cof
+   %cval  = OpLoad %f32 %cp
+   %rowm  = OpIMul %u32 %ww %c16u
+   %rowg2 = OpIAdd %u32 %row0 %rowm
+   %rowg3 = OpIAdd %u32 %rowg2 %tm2
+   %colm  = OpIMul %u32 %td %c16u
+   %colg2 = OpIAdd %u32 %col0 %colm
+   %colg3 = OpIAdd %u32 %colg2 %tn
+   %rOk2  = OpULessThan %bool %rowg3 %outdim
+   %cOk2  = OpULessThan %bool %colg3 %ntok
+   %ok2   = OpLogicalAnd %bool %rOk2 %cOk2
+   OpSelectionMerge %wskip None
+   OpBranchConditional %ok2 %wstore %wskip
+ %wstore = OpLabel
+   %scal  = OpFMul %f32 %cval %scale
+   %yrow  = OpIMul %u32 %colg3 %outdim
+   %yidx  = OpIAdd %u32 %yrow %rowg3
+   %py    = OpAccessChain %p_s32 %var_y %c0u %yidx
+   OpStore %py %scal
+   OpBranch %wskip
+ %wskip = OpLabel
+   OpBranch %wlatch
+ %wlatch = OpLabel
+   %iW_n  = OpIAdd %u32 %iW %c1u
+   OpBranch %wloop
+ %wdone = OpLabel
+   OpReturn
+           OpFunctionEnd

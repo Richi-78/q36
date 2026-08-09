@@ -120,6 +120,7 @@ typedef struct {
     bool prof_kernel;
     bool have_f16;
     bool have_storage16;
+    bool have_cooperative_matrix;
     bool subgroup_arithmetic;
     bool subgroup_clustered;
     bool bc250;
@@ -158,6 +159,7 @@ typedef struct {
     q36_vk_kernel matmul_q8_0_mm;
     q36_vk_kernel matmul_q8_0_mm_f16;
     q36_vk_kernel matmul_q8_0_mm_f16_out32;
+    q36_vk_kernel matmul_q8_0_mm_f16_cm;
     q36_vk_kernel matmul_q8_0_f32b_nx;
     q36_vk_kernel matmul_q8_0_decode;
     q36_vk_kernel matmul_q8_0_decode_q36;
@@ -2633,6 +2635,7 @@ int q36_gpu_init(void) {
     q36_vk.matmul_q8_0_mm = Q36_VK_KERNEL("vulkan/matmul_q8_0_mm.spv", 3, 20, 1u << 2);
     q36_vk.matmul_q8_0_mm_f16 = Q36_VK_KERNEL("vulkan/matmul_q8_0_mm_f16.spv", 3, 20, 1u << 2);
     q36_vk.matmul_q8_0_mm_f16_out32 = Q36_VK_KERNEL("vulkan/matmul_q8_0_mm_f16_out32.spv", 3, 20, 1u << 2);
+    q36_vk.matmul_q8_0_mm_f16_cm = Q36_VK_KERNEL("vulkan/matmul_q8_0_mm_f16_cm.spv", 3, 20, 1u << 2);
     q36_vk.matmul_q8_0_f32b_nx = Q36_VK_KERNEL("vulkan/matmul_q8_0_f32b_nx.spv", 3, 20, 1u << 2);
     q36_vk.matmul_q8_0_decode = Q36_VK_KERNEL("vulkan/matmul_q8_0_decode.spv", 3, 20, 1u << 2);
     q36_vk.matmul_q8_0_decode_q36 = Q36_VK_KERNEL("vulkan/matmul_q8_0_decode_q36.spv", 3, 20, 1u << 2);
@@ -2790,15 +2793,74 @@ int q36_gpu_init(void) {
      * emulate correctly rounded f32 fma via int64 bit ops to stay bit-exact
      * against the CPU reference engine, so shaderFloat64 and shaderInt64 are
      * hard requirements (RADV exposes both on the BC-250 target). */
+    const char *cm_env = getenv("Q36_VK_Q8_MM_CM");
+    const bool cm_requested = cm_env && cm_env[0] && cm_env[0] != '0';
+    bool cm_extension = false;
+    bool cm_shape = false;
+    uint32_t device_ext_count = 0;
+    if (vkEnumerateDeviceExtensionProperties(q36_vk.physical, NULL,
+                                             &device_ext_count, NULL) == VK_SUCCESS) {
+        VkExtensionProperties *device_exts = calloc(device_ext_count, sizeof(*device_exts));
+        if (device_exts) {
+            if (vkEnumerateDeviceExtensionProperties(q36_vk.physical, NULL,
+                                                     &device_ext_count, device_exts) == VK_SUCCESS) {
+                for (uint32_t i = 0; i < device_ext_count; i++) {
+                    if (strcmp(device_exts[i].extensionName,
+                               VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0) {
+                        cm_extension = true;
+                        break;
+                    }
+                }
+            }
+            free(device_exts);
+        }
+    }
+    if (cm_extension) {
+        PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR get_cm_props =
+            (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+            vkGetInstanceProcAddr(q36_vk.instance,
+                                   "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+        if (get_cm_props) {
+            uint32_t property_count = 0;
+            if (get_cm_props(q36_vk.physical, &property_count, NULL) == VK_SUCCESS) {
+                VkCooperativeMatrixPropertiesKHR *properties =
+                    calloc(property_count, sizeof(*properties));
+                if (properties) {
+                    for (uint32_t i = 0; i < property_count; i++)
+                        properties[i].sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+                    if (get_cm_props(q36_vk.physical, &property_count, properties) == VK_SUCCESS) {
+                        for (uint32_t i = 0; i < property_count; i++) {
+                            const VkCooperativeMatrixPropertiesKHR *p = &properties[i];
+                            if (p->MSize == 16u && p->NSize == 16u && p->KSize == 16u &&
+                                p->AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                p->BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                p->CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                                p->ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                                p->scope == VK_SCOPE_SUBGROUP_KHR &&
+                                !p->saturatingAccumulation) {
+                                cm_shape = true;
+                                break;
+                            }
+                        }
+                    }
+                    free(properties);
+                }
+            }
+        }
+    }
     VkPhysicalDevice16BitStorageFeatures storage16_query = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
     };
     VkPhysicalDeviceShaderFloat16Int8Features f16_query = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
     };
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm_query = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+    };
     if (q36_vk.api_version >= VK_API_VERSION_1_2 &&
         q36_vk.props.apiVersion >= VK_API_VERSION_1_2) {
         storage16_query.pNext = &f16_query;
+        if (cm_extension) f16_query.pNext = &cm_query;
     }
     VkPhysicalDeviceFeatures2 feat2 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
@@ -2811,6 +2873,11 @@ int q36_gpu_init(void) {
     }
     q36_vk.have_storage16 = storage16_query.storageBuffer16BitAccess != 0;
     q36_vk.have_f16 = q36_vk.have_storage16 && f16_query.shaderFloat16;
+    q36_vk.have_cooperative_matrix = cm_requested && cm_extension && cm_shape &&
+                                     cm_query.cooperativeMatrix && q36_vk.have_f16;
+    if (q36_vk.have_cooperative_matrix) {
+        fprintf(stderr, "q36: cooperative matrix Q8 prototype available (16x16x16 F16/F16->F32)\n");
+    }
     VkPhysicalDeviceFeatures enabled = { .shaderFloat64 = VK_TRUE, .shaderInt64 = VK_TRUE };
     VkPhysicalDevice16BitStorageFeatures storage16_enable = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
@@ -2820,15 +2887,33 @@ int q36_gpu_init(void) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
         .shaderFloat16 = VK_TRUE,
     };
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm_enable = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+        .cooperativeMatrix = q36_vk.have_cooperative_matrix ? VK_TRUE : VK_FALSE,
+    };
+    const char *device_extensions[1];
+    uint32_t device_extension_count = 0;
+    if (q36_vk.have_cooperative_matrix) {
+        device_extensions[device_extension_count++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
+    }
     VkDeviceCreateInfo dci = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &qci,
         .pEnabledFeatures = &enabled,
+        .enabledExtensionCount = device_extension_count,
+        .ppEnabledExtensionNames = device_extension_count ? device_extensions : NULL,
     };
     if (q36_vk.have_storage16) {
         dci.pNext = &storage16_enable;
-        if (q36_vk.have_f16) storage16_enable.pNext = &f16_enable;
+        if (q36_vk.have_f16) {
+            storage16_enable.pNext = &f16_enable;
+            if (q36_vk.have_cooperative_matrix) f16_enable.pNext = &cm_enable;
+        } else if (q36_vk.have_cooperative_matrix) {
+            storage16_enable.pNext = &cm_enable;
+        }
+    } else if (q36_vk.have_cooperative_matrix) {
+        dci.pNext = &cm_enable;
     }
     if (vkCreateDevice(q36_vk.physical, &dci, NULL, &q36_vk.device) != VK_SUCCESS) goto fail;
     vkGetDeviceQueue(q36_vk.device, q36_vk.queue_family, 0, &q36_vk.queue);
@@ -3011,6 +3096,7 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.matmul_q8_0_mm);
     q36_vk_kernel_destroy(&q36_vk.matmul_q8_0_mm_f16);
     q36_vk_kernel_destroy(&q36_vk.matmul_q8_0_mm_f16_out32);
+    q36_vk_kernel_destroy(&q36_vk.matmul_q8_0_mm_f16_cm);
     q36_vk_kernel_destroy(&q36_vk.matmul_q8_0_f32b_nx);
     q36_vk_kernel_destroy(&q36_vk.matmul_q8_0_q36);
     q36_vk_kernel_destroy(&q36_vk.matmul_q8_0);
@@ -3844,6 +3930,15 @@ static bool q36_vk_use_q8_mm_f16(void) {
            q36_vk_env_default_on("Q36_VK_Q8_MM_F16");
 }
 
+/* The cooperative shader is opt-in until it has been benchmarked against the
+ * packed-f16 baseline on each RADV release. Its two-subgroup tile is
+ * correctness-critical on Phoenix; Q36_VK_Q8_MM_CM=1 is a diagnostic and
+ * performance switch, not a silent hardware-wide default. */
+static bool q36_vk_use_q8_mm_f16_cm(void) {
+    const char *env = getenv("Q36_VK_Q8_MM_CM");
+    return q36_vk.have_cooperative_matrix && env && env[0] && env[0] != '0';
+}
+
 static bool q36_vk_use_q8_mm_f16_out32(void) {
     return q36_vk_env_default_on("Q36_VK_Q8_MM_F16_OUT32");
 }
@@ -3884,12 +3979,15 @@ static int q36_vk_matmul_q8_0_mm(q36_gpu_tensor *out,
     if (ok) {
         const q36_gpu_tensor *bindings[3] = { weights, x, out };
         const char *op = q36_vk.prof_ops ? q36_vk_q8_0_op_name(out_dim, blocks, n_tok) : "dense_q8_0";
+        int cm = q36_vk_use_q8_mm_f16_cm();
         int f16 = q36_vk_use_q8_mm_f16();
-        int out32 = f16 && out_dim == 32u && q36_vk_use_q8_mm_f16_out32();
-        q36_vk_kernel *kernel = out32 ? &q36_vk.matmul_q8_0_mm_f16_out32 :
-                                f16 ? &q36_vk.matmul_q8_0_mm_f16 :
-                                      &q36_vk.matmul_q8_0_mm;
-        uint32_t gx = out32 ? 1u :
+        int out32 = !cm && f16 && out_dim == 32u && q36_vk_use_q8_mm_f16_out32();
+        q36_vk_kernel *kernel = cm ? &q36_vk.matmul_q8_0_mm_f16_cm :
+                              out32 ? &q36_vk.matmul_q8_0_mm_f16_out32 :
+                              f16 ? &q36_vk.matmul_q8_0_mm_f16 :
+                                    &q36_vk.matmul_q8_0_mm;
+        uint32_t gx = cm ? (uint32_t)((out_dim + 31u) / 32u) :
+                      out32 ? 1u :
                       f16 ? (uint32_t)((out_dim + 127u) / 128u) :
                             (uint32_t)((out_dim + 63u) / 64u);
         uint32_t gy = out32 ? (uint32_t)((n_tok + 63u) / 64u) :

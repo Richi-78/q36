@@ -1,6 +1,7 @@
 CC ?= cc
 CXX ?= c++
 GLSLC ?= ./glslc
+SPIRV_AS ?= tools/SPIRV-Tools/build/tools/spirv-as
 .DEFAULT_GOAL := all
 UNAME_S := $(shell uname -s)
 
@@ -133,6 +134,11 @@ vulkan/matmul_q8_0_mm_f16.spv: vulkan/matmul_q8_0_mm_f16.comp
 vulkan/matmul_q8_0_mm_f16_out32.spv: vulkan/matmul_q8_0_mm_f16_out32.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
+# Hand-assembled cooperative-matrix code is opt-in: normal builds do not
+# require a local SPIR-V assembler, and the runtime keeps the path disabled.
+vulkan/matmul_q8_0_mm_f16_cm.spv: vulkan/matmul_q8_0_mm_f16_cm.spvasm
+	$(SPIRV_AS) --target-env vulkan1.3 $< -o $@
+
 vulkan/matmul_q8_0_f32b_nx.spv: vulkan/matmul_q8_0_f32b_nx.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
@@ -181,7 +187,7 @@ CORE_OBJS := q36_gpu_core.o q36_vulkan.o
 METAL_CORE_OBJS := q36_gpu_core_metal.o q36_metal.o
 CPU_CORE_OBJS := q36_cpu.o
 
-.PHONY: all help cpu gpu vulkan vulkan-generic vulkan-bc250 metal q36-quality-score test test-metal test-metal-model test-quick test-all test-unit test-vulkan test-streaming test-mtp test-model test-session-batch test-server-live test-server-live-metal test-server-live-metal-ssd test-server-batching test-server-batching-metal test-server-batching-metal-ssd test-release release-build-check release-build-check-metal benchmark-gate benchmark-session-batch test-reference test-reference-local test-vectors-local reference-openrouter test-llama test-llama-long test-llama-batch test-llama-all clean
+.PHONY: all help cpu gpu vulkan vulkan-generic vulkan-bc250 q8-cm metal q36-quality-score test test-metal test-metal-model test-quick test-all test-unit test-vulkan test-streaming test-mtp test-model test-session-batch test-server-live test-server-live-metal test-server-live-metal-ssd test-server-batching test-server-batching-metal test-server-batching-metal-ssd test-release release-build-check release-build-check-metal benchmark-gate benchmark-session-batch test-reference test-reference-local test-vectors-local reference-openrouter test-llama test-llama-long test-llama-batch test-llama-all clean
 
 all: q36 q36-server q36-bench q36-agent q36-eval q36_test
 
@@ -190,6 +196,7 @@ help:
 	@echo "  make              Build generic Vulkan with automatic BC-250 fast-path selection (default)"
 	@echo "  make vulkan-generic  Build generic Vulkan for runtime capability detection"
 	@echo "  make vulkan-bc250    Build Vulkan and require an AMD BC-250 at runtime"
+	@echo "  make q8-cm          Assemble the opt-in cooperative-matrix Q8 GEMM prototype"
 	@echo "  make metal        Build the same binaries with the Metal backend (macOS)"
 	@echo "  make test-metal   Build Metal and run its model-independent unit and kernel tests"
 	@echo "  make test-metal-model  Run Metal model, parity, streaming, and state tests"
@@ -214,6 +221,8 @@ vulkan-generic:
 
 vulkan-bc250:
 	$(MAKE) -B all VULKAN_CFLAGS=-DQ36_VULKAN_REQUIRE_BC250
+
+q8-cm: vulkan/matmul_q8_0_mm_f16_cm.spv
 
 metal: q36_cli_metal.o q36_server.o q36_bench.o q36_agent.o q36_eval.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o rax.o q36_test_metal.o q36_gpu_core_metal_test.o $(METAL_CORE_OBJS)
 	$(CC) $(METAL_LDFLAGS) -o q36 q36_cli_metal.o q36_ssd.o linenoise.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
