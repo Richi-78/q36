@@ -87,9 +87,52 @@ Tests showed that:
 - Disabling MoE GEMM gives no useful improvement at longer contexts.
 - Disabling `delta_net_cols` is the clear Phoenix-specific win.
 
+## Cooperative matrices: the main structural gap (partly closed)
+
+The largest single difference between this backend and a stock llama.cpp Vulkan
+build on RDNA3 is that llama.cpp feeds its quantized matmuls through KHR
+cooperative-matrix (WMMA) shaders and q36 had none — every GEMM here is a
+hand-rolled packed-f16 FMA loop. Prefill is GEMM-bound, so that is where the
+prompt-processing gap comes from; decode is bandwidth-bound, which is why
+decode was already competitive at ~25 t/s while prefill was not.
+
+This was believed to be blocked by tooling. It was not: the version string
+`11:16.2.0` is Fedora's packaging **epoch 11** plus glslang **16.2.0**, not
+glslang 11.16.2, and 16.2.0 compiles `GL_KHR_cooperative_matrix` without
+complaint. `/usr/bin/glslc` (shaderc 2026.1) is also installed and unused,
+because the repo's `./glslc` wrapper execs `glslangValidator` directly.
+
+The dense Q8 GEMM now has a cooperative-matrix implementation
+(`vulkan/matmul_q8_0_mm_f16_cm.comp`, 128-row x 64-token tile, four subgroups):
+
+```sh
+make q8-cm                                  # builds via GLSLC_CM, not ./glslc
+Q36_VK_Q8_MM_CM=1 ./q36-bench --vulkan ...  # opt-in
+./tools/cmgemm                              # correctness vs f64 + baseline
+CMGEMM_BENCH=1 ./tools/cmgemm               # throughput A/B
+```
+
+Measured at ctx 2048 / chunk 1024, three warm runs each: prefill **222.32 ->
+239.61 t/s (+7.8%)**, decode unchanged. The dense Q8 GEMM family itself is
+**1.40x** faster, and the kernel is *more* accurate than the one it replaces
+(f32 accumulation instead of 8-term f16 chains).
+
+One counter-intuitive result worth keeping: a first 64x64 cooperative tile tied
+the existing kernel exactly, because at that tile size the GEMM saturates DDR5
+(99 GB/s) while the WMMA units idle. The gain came from halving the activation
+stream with a 128-row tile, not from the inner loop. Activations are f32 and
+Q8_0 weights are ~1.06 B/element, so the X stream dominates and `BM` is the
+lever; a 256-row tile lost the gain again to occupancy.
+
+Remaining: `moe_gate_up_gemm` (26% of GPU time) and `moe_down_gemm` (14%) are
+together twice the dense Q8 share and have the same structure, so the same
+treatment applies. Their dequant staging is reusable; only the inner loop
+changes. See `achievements.md` section 15 for full detail.
+
 ## Why llama.cpp may report around 300 t/s
 
-The comparison is useful, but may not be directly equivalent. Results depend on:
+Much of it is the cooperative-matrix gap above. Beyond that, the comparison may
+not be directly equivalent. Results depend on:
 
 - Model architecture and quantization
 - Prompt length and benchmark method

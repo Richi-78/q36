@@ -134,10 +134,14 @@ vulkan/matmul_q8_0_mm_f16.spv: vulkan/matmul_q8_0_mm_f16.comp
 vulkan/matmul_q8_0_mm_f16_out32.spv: vulkan/matmul_q8_0_mm_f16_out32.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
-# Hand-assembled cooperative-matrix code is opt-in: normal builds do not
-# require a local SPIR-V assembler, and the runtime keeps the path disabled.
-vulkan/matmul_q8_0_mm_f16_cm.spv: vulkan/matmul_q8_0_mm_f16_cm.spvasm
-	$(SPIRV_AS) --target-env vulkan1.3 $< -o $@
+# Cooperative-matrix kernels stay opt-in (`make q8-cm`) because they need a
+# glslang new enough for GL_KHR_cooperative_matrix, which the ./glslc wrapper
+# is not guaranteed to reach. GLSLC_CM is therefore separate from GLSLC: the
+# other shaders keep whatever compiler ./glslc resolves to, so their .spv
+# output stays bit-identical when this target is built.
+GLSLC_CM ?= glslc
+vulkan/matmul_q8_0_mm_f16_cm.spv: vulkan/matmul_q8_0_mm_f16_cm.comp
+	$(GLSLC_CM) -O --target-env=vulkan1.3 -o $@ $<
 
 vulkan/matmul_q8_0_f32b_nx.spv: vulkan/matmul_q8_0_f32b_nx.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<

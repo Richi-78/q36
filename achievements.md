@@ -154,6 +154,11 @@ One tooling blocker was verified: **glslangValidator 11.16.2 does not support
 prototype therefore uses hand-assembled SPIR-V
 (`OpCooperativeMatrixMulAddKHR` + `OpTypeCooperativeMatrixKHR`).
 
+> **Superseded — see section 15. This blocker does not exist.** The version
+> string `11:16.2.0` is Fedora's *epoch 11* plus version *16.2.0*; the local
+> glslang is 16.2.0, not 11.16.2, and it compiles `GL_KHR_cooperative_matrix`
+> fine. The hand-assembled SPIR-V (and its 64-row bug below) was unnecessary.
+
 ### Net result
 
 All measured geometry experiments confirm the shipped defaults; no tuning change
@@ -199,3 +204,175 @@ Three sequential runs used:
 
 This is approximately 7.9% above the previous 208.90 t/s prefill baseline.
 The cooperative-matrix prototype was not used for these production results.
+
+## 15. Cooperative-matrix Q8 GEMM — shipped as GLSL, measured, opt-in
+
+### The tooling blocker was a misread version string
+
+Sections 12 and 13 record `GL_KHR_cooperative_matrix` as unsupported by the
+local toolchain. That conclusion was wrong. `glslangValidator --version`
+prints:
+
+```text
+Glslang Version: 11:16.2.0
+ESSL Version: OpenGL ES GLSL 3.20 glslang Khronos. 16.2.0
+```
+
+`11:` is the Fedora packaging **epoch**, not a major version: this is glslang
+**16.2.0**, which has supported `GL_KHR_cooperative_matrix` since 13.x. The
+machine additionally has `/usr/bin/glslc` = shaderc **v2026.1**, which the
+repo's `./glslc` wrapper never reaches because it execs `glslangValidator`
+directly.
+
+Both compilers emit real cooperative-matrix SPIR-V. Parsing the binaries shows
+capability `4433` (`CooperativeMatrixKHR`), `SPV_KHR_cooperative_matrix`, and
+both `OpTypeCooperativeMatrixKHR` and `OpCooperativeMatrixMulAddKHR`. A plain
+GLSL probe run through `tools/cmrun` on the 780M returns:
+
+```text
+device: AMD Radeon 780M Graphics (RADV PHOENIX) (subgroup 64)
+C checksum=-2.167 maxerr=0.00000 bad=0
+CM-PROBE-OK
+```
+
+Hand-assembled SPIR-V was therefore never required, and the 64-row zeroing bug
+in section 13 was an artifact of hand-assembling rather than a hardware or
+layout constraint.
+
+### The kernel
+
+`vulkan/matmul_q8_0_mm_f16_cm.comp` replaces the `.spvasm` prototype. One
+256-thread workgroup owns a **128-row x 64-token** tile; four subgroups sit in
+a 2x2 grid, each holding 4x2 accumulators of the 16x16x16 F16xF16->F32 shape.
+Weights dequantize to f16 with the block scale folded in, activations round
+once to f16, and all accumulation is f32 inside the cooperative matrix.
+
+The shader guards on `gl_SubgroupID < 4`, so it is correct on both wave64 (4
+full subgroups) and wave32 (subgroups 4-7 idle) without any
+required-subgroup-size pipeline state.
+
+Build is opt-in and does not disturb the other shaders:
+
+```sh
+make q8-cm          # uses GLSLC_CM (default: system glslc), not ./glslc
+```
+
+### Why the tile is 128x64: this GEMM is DRAM-bound, not issue-bound
+
+The first version used a 64x64 tile and measured **exactly tied** with the
+shipping packed-f16 kernel (~2500 GF/s each). Traffic analysis explains it — a
+tiled GEMM re-reads X `out_dim/BM` times and W `n_tok/BN` times, and X is f32
+against ~1.06 B/element Q8_0 weights, so the activation stream dominates:
+
+| tile | X | W | total | achieved |
+|---|---|---|---|---|
+| f16 128x64 | 134.2 MB | 71.3 MB | 205.5 MB | 59.8 GB/s |
+| cm 64x64 | 268.4 MB | 71.3 MB | 339.7 MB | **99.2 GB/s** |
+
+The 64x64 tile was saturating DDR5 while the WMMA units idled; the two kernels
+tied by coincidence. Doubling BM halved the X stream. Going further to 256x64
+*lost* the gain again (16 accumulators/subgroup plus 25 KB LDS costs more
+occupancy than the traffic saving buys), so 128x64 is the measured optimum:
+
+| tile | 2048x1024 k=2048 | vs f16 |
+|---|---|---|
+| cm 64x64 | 3.426 ms | 1.00x |
+| **cm 128x64** | **2.388 ms** | **1.44x** |
+| cm 256x64 | 2.665 ms | 1.29x |
+
+Isolated kernel throughput, `CMGEMM_BENCH=1 ./tools/cmgemm` (best of 3, 50
+dispatches):
+
+| shape | f16 | cm | speedup |
+|---|---|---|---|
+| 2048x1024 k=2048 | 2501 GF/s | 3597 GF/s | 1.44x |
+| 4096x1024 k=2048 | 2561 | 3609 | 1.41x |
+| 2048x512 k=2048 | 2449 | 3543 | 1.45x |
+| 6144x1024 k=2048 | 2584 | 3597 | 1.39x |
+| 1024x1024 k=4096 | 2489 | 3822 | 1.54x |
+
+### Correctness
+
+`tools/cmgemm` runs the real kernel against an f64 CPU reference across eight
+shapes, poisons the output buffer first to catch untouched elements, and also
+runs the shipping kernel for comparison. The shape that broke the hand-written
+prototype (`out_dim=130, n_tok=67, blocks=2`) passes. The cooperative kernel is
+**more** accurate than the kernel it replaces on every shape, because it
+accumulates in f32 rather than in 8-term f16 chains:
+
+```text
+  out_dim=130   n_tok=67    blocks=2    maxrel cm=0.00703  f16=0.01949  OK
+  out_dim=31    n_tok=129   blocks=5    maxrel cm=0.01283  f16=0.04686  OK
+  out_dim=1536  n_tok=97    blocks=8    maxrel cm=0.01681  f16=0.03475  OK
+  CM-GEMM-OK
+```
+
+`./q36_test --vulkan-kernels` and `make test` pass with and without the path
+enabled.
+
+The batch-size invariance gate — the one this kernel could plausibly have
+broken, since it changes the accumulation order — passes exactly with the path
+enabled:
+
+```text
+q36-test: session-sync-resume warm-vs-cold step 0 top1 ref=674 cand=674
+          top5_overlap=5/5 top15_overlap=15/15 top20_overlap=20/20
+          top64_overlap=64/64 rms=0 max_abs=0
+session-sync-resume: OK
+```
+
+**Not yet run with the path enabled:** `--gpu-cpu-parity` and
+`--vulkan-fusion-parity` (both were interrupted mid-capture). Those should pass
+before this is considered for default-on; until then `Q36_VK_Q8_MM_CM` stays
+opt-in and the default route is untouched.
+
+### End-to-end
+
+`--ctx-start 2048 --ctx-max 2048 --prefill-chunk 1024 --gen-tokens 8`, three
+warm runs each. (Discard first-run numbers: a cold page cache costs ~8%.)
+
+| | run 1 | run 2 | run 3 | avg |
+|---|---:|---:|---:|---:|
+| baseline | 226.59 | 218.64 | 221.73 | **222.32** |
+| `Q36_VK_Q8_MM_CM=1` | 242.35 | 238.37 | 238.11 | **239.61** |
+
+**+7.8% prefill**, generation unchanged (~25 t/s). Per-kernel GPU time:
+
+| shape | baseline | coopmat | speedup |
+|---|---:|---:|---:|
+| dense_q8_0_p_8192x2048 | 2293.1 ms | 1686.3 ms | 1.36x |
+| dense_q8_0_p_4096x2048 | 850.1 | 617.8 | 1.38x |
+| dense_q8_0_p_2048x4096 | 1134.4 | 776.8 | 1.46x |
+| dense_q8_0_p_512x2048 | 391.4 | 252.7 | 1.55x |
+| dense_q8_0_p_2048x512 | 140.3 | 87.3 | 1.61x |
+| dense_q8_0_p_32x2048 | 47.8 | 48.1 | 1.00x (falls back) |
+| **total dense Q8 prefill** | **4857** | **3469** | **1.40x** |
+
+1.40x on a 26% share predicts +8.5% end-to-end; +7.8% measured.
+
+`out_dim < 128` keeps the specialized kernels: the 128-row tile would leave
+most of a narrow projection idle, which is why `dense_q8_0_p_32x2048` is
+deliberately unchanged.
+
+### Note on benchmark methodology
+
+Two traps cost real time here and are worth recording:
+
+1. **Grid/tile mismatch is silent.** The dispatch grid in `q36_vulkan.c` must
+   match the shader's `BM`. An oversized grid still produces *correct* output
+   (out-of-range rows are guarded) but runs the full k-loop doing nothing —
+   the first end-to-end measurement showed a 5% *loss* from exactly this. The
+   `groups=` field in `Q36_VK_PROF_KERNEL=1` output is the check: it must not
+   change when only the kernel changes.
+2. **First run after a build is cold.** Baseline measured 205.68 cold and
+   222.32 warm. Always discard run 1.
+
+### Next
+
+The same treatment applies to `moe_gate_up_gemm` (4874 ms, 26%) and
+`moe_down_gemm` (2680 ms, 14%) — together twice the dense Q8 share, and both
+have the identical structure (dequantize to a staged f16 tile, then a
+hand-rolled packed-f16 inner loop). The dequant staging is reusable as-is; only
+the inner loop changes. Note those kernels stage from IQ2_XXS and Q2_K rather
+than Q8_0, and their B operand is already a routed token tile, so the traffic
+arithmetic that picked 128x64 here has to be redone for them.

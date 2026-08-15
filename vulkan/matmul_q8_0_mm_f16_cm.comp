@@ -1,0 +1,190 @@
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+/* Prefill Q8_0 GEMM on KHR cooperative matrices (RDNA3 WMMA). Same
+ * 3-binding/20-byte-push interface as matmul_q8_0_mm_f16, so it drops
+ * into the same dispatch slot behind Q36_VK_Q8_MM_CM=1.
+ *
+ * Tile: one 256-thread workgroup owns a 128-row x 64-token output tile.
+ * Four subgroups sit in a 2x2 grid, each owning 64 rows x 32 tokens as
+ * 4x2 accumulators of the 16x16x16 F16xF16->F32 shape RADV Phoenix
+ * reports.
+ *
+ * Why this shape: on Phoenix the limit here is DRAM traffic, not FMA
+ * issue. Per dispatch a tiled GEMM re-reads X (out_dim/BM) times and W
+ * (n_tok/BN) times, and X is f32 while Q8_0 weights are ~1.06 B/element,
+ * so the activation stream dominates and BM is the lever. A 64x64 tile
+ * measured 99 GB/s on this part - the DDR5 ceiling - and tied the
+ * hand-rolled packed-f16 kernel despite the WMMA units idling. Doubling
+ * BM halves the X stream and buys back that headroom. BN stays 64 so the
+ * accumulator count per subgroup (8) keeps the register file clear of
+ * spills.
+ *
+ * Numerics: weights stage as q*d rounded once to f16 (|q| <= 127 and d
+ * is the f16 block scale, so no overflow), activations round once to
+ * f16, and all accumulation runs in f32 inside the cooperative matrix.
+ * matmul_q8_0_mm_f16 instead keeps A exact as q*2^-7 and accumulates
+ * 8-term f16 chains before flushing to f32; measured against an f64
+ * reference this kernel is the more accurate of the two on every shape
+ * tools/cmgemm covers. Per-output k order is the sequential block loop
+ * and does not depend on n_tok, preserving the batch-size invariance
+ * rule (warm == cold).
+ *
+ * Subgroup size: the tile assumes at least 4 subgroups per workgroup and
+ * guards on gl_SubgroupID, so a wave64 device runs 4 full subgroups and a
+ * wave32 device runs the same tile on subgroups 0-3 with 4-7 idle. Both
+ * are correct; only wave64 is fast. No required-subgroup-size pipeline
+ * state is needed. */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Weights {
+    uint16_t wb16[];
+};
+
+layout(set = 0, binding = 1) readonly buffer X {
+    float xv[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer Output {
+    float y[];
+};
+
+layout(push_constant) uniform Push {
+    uint out_dim;
+    uint n_tok;
+    uint blocks;
+    uint row_bytes;
+    float scale;
+} pc;
+
+/* One Q8_0 block is 17 uint16 words: [d_f16][16 x 2 qs bytes]. */
+const uint Q8_0_U16 = 17u;
+const uint BM = 128u;
+const uint BN = 64u;
+const uint BK = 32u;
+/* Row strides carry an 8-element pad so the 16-wide cooperative loads do
+ * not land every fragment row on the same LDS banks. */
+const uint SA = BK + 8u;
+const uint SB = BN + 8u;
+
+shared float16_t As[BM * SA];
+shared float16_t Bs[BK * SB];
+/* Ragged-edge drain only: one 16x16 f32 staging tile per subgroup. */
+shared float Cs[4u * 256u];
+
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define FRAG_A coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define FRAG_B coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+
+void main(void) {
+    uint tid = gl_LocalInvocationID.x;
+    uint row0 = gl_WorkGroupID.x * BM;
+    uint col0 = gl_WorkGroupID.y * BN;
+    uint in_dim = pc.blocks * BK;
+    uint sgid = gl_SubgroupID;
+    uint sg_m = sgid & 1u;
+    uint sg_n = sgid >> 1u;
+
+    ACC acc[4][2];
+    for (uint i = 0u; i < 4u; i++)
+        for (uint j = 0u; j < 2u; j++) acc[i][j] = ACC(0.0);
+
+    /* Staging: A is 128 rows x 32 k (16 k-elements per thread), B is 64
+     * tokens x 32 k (8 k-elements per thread). */
+    uint ar = tid >> 1u;
+    uint asub = tid & 1u;
+    uint bc = tid >> 2u;
+    uint bsub = tid & 3u;
+
+    for (uint kb = 0u; kb < pc.blocks; kb++) {
+        {
+            uint row = row0 + ar;
+            bool live = row < pc.out_dim;
+            uint base = live ? (row * pc.blocks + kb) * Q8_0_U16 : 0u;
+            float16_t dh = float16_t(live ? unpackHalf2x16(uint(wb16[base])).x : 0.0);
+            uint q = base + 1u + asub * 8u;
+            uint o = ar * SA + asub * 16u;
+            for (uint w = 0u; w < 4u; w++) {
+                uint p = uint(wb16[q + w * 2u]) | (uint(wb16[q + w * 2u + 1u]) << 16u);
+                f16vec4 v = f16vec4(unpack8(int(p))) * dh;
+                As[o + w * 4u + 0u] = v.x;
+                As[o + w * 4u + 1u] = v.y;
+                As[o + w * 4u + 2u] = v.z;
+                As[o + w * 4u + 3u] = v.w;
+            }
+        }
+        /* B transposed to [k][n] so the B fragment loads row-major. */
+        {
+            uint col = col0 + bc;
+            bool ok = col < pc.n_tok;
+            uint xb = col * in_dim + kb * BK + bsub * 8u;
+            for (uint e = 0u; e < 8u; e++) {
+                float xe = ok ? xv[xb + e] : 0.0;
+                Bs[(bsub * 8u + e) * SB + bc] = float16_t(xe);
+            }
+        }
+        barrier();
+
+        if (sgid < 4u) {
+            for (uint kk = 0u; kk < 2u; kk++) {
+                FRAG_A a[4];
+                FRAG_B b[2];
+                for (uint i = 0u; i < 4u; i++)
+                    coopMatLoad(a[i], As, (sg_m * 64u + i * 16u) * SA + kk * 16u, SA,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                for (uint j = 0u; j < 2u; j++)
+                    coopMatLoad(b[j], Bs, (kk * 16u) * SB + sg_n * 32u + j * 16u, SB,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                for (uint i = 0u; i < 4u; i++)
+                    for (uint j = 0u; j < 2u; j++)
+                        acc[i][j] = coopMatMulAdd(a[i], b[j], acc[i][j]);
+            }
+        }
+        barrier();
+    }
+
+    /* row0/col0 are workgroup-uniform, so this branch is uniform and the
+     * barriers inside the ragged path stay legal. */
+    bool interior = (row0 + BM <= pc.out_dim) && (col0 + BN <= pc.n_tok);
+
+    if (interior) {
+        if (sgid < 4u) {
+            for (uint i = 0u; i < 4u; i++) {
+                for (uint j = 0u; j < 2u; j++) {
+                    uint rb = row0 + sg_m * 64u + i * 16u;
+                    uint cb = col0 + sg_n * 32u + j * 16u;
+                    /* y is token-major: element (m,n) sits at
+                     * (cb+n)*out_dim + rb+m, i.e. column-major stride out_dim. */
+                    coopMatStore(acc[i][j] * pc.scale, y, cb * pc.out_dim + rb,
+                                 pc.out_dim, gl_CooperativeMatrixLayoutColumnMajor);
+                }
+            }
+        }
+    } else {
+        for (uint i = 0u; i < 4u; i++) {
+            for (uint j = 0u; j < 2u; j++) {
+                if (sgid < 4u)
+                    coopMatStore(acc[i][j], Cs, sgid * 256u, 16u,
+                                 gl_CooperativeMatrixLayoutRowMajor);
+                barrier();
+                for (uint e = 0u; e < 4u; e++) {
+                    uint idx = tid + 256u * e;
+                    uint sg = idx >> 8u;
+                    uint el = idx & 255u;
+                    uint row = row0 + (sg & 1u) * 64u + i * 16u + (el >> 4u);
+                    uint col = col0 + (sg >> 1u) * 32u + j * 16u + (el & 15u);
+                    if (row < pc.out_dim && col < pc.n_tok)
+                        y[col * pc.out_dim + row] = Cs[sg * 256u + el] * pc.scale;
+                }
+                barrier();
+            }
+        }
+    }
+}

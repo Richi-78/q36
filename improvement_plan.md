@@ -159,10 +159,29 @@ open item: runtime shape list confirmed (16x16x16 F16x F16→F32 exists),
 but GLSL tooling cannot emit it (glslang lacks GL_KHR_cooperative_matrix),
 so a prototype requires hand-written SPIR-V.
 
+> **Correction (2026-08-15).** The GLSL tooling claim above is wrong: the
+> local glslang is 16.2.0 (`11:` in the version string is Fedora's epoch),
+> and shaderc 2026.1 is installed as `/usr/bin/glslc`. Both compile
+> `GL_KHR_cooperative_matrix`. Item 2 is now **done for dense Q8** as plain
+> GLSL — `vulkan/matmul_q8_0_mm_f16_cm.comp`, 1.40x on the dense Q8 GEMM
+> family and **+7.8% end-to-end prefill** behind `Q36_VK_Q8_MM_CM=1`. See
+> `achievements.md` section 15.
+>
+> The measurement that mattered was not the inner loop: a first 64x64
+> cooperative tile tied the existing kernel exactly, because at that tile
+> size the GEMM saturates DDR5 (99 GB/s) while the WMMA units idle. The
+> win came from halving the activation stream with a 128-row tile. Note
+> this contradicts the "geometry is not the remaining lever" takeaway from
+> the tile sweep above — that conclusion held only for the packed-f16
+> kernel, which is issue-bound at 60 GB/s and therefore insensitive to
+> traffic. Once the inner loop stops being the bottleneck, tile geometry
+> becomes the bottleneck again.
+
 Next candidates to attack first (ranked by measured GPU share and risk):
 
-1. Cooperative-matrix GEMM prototype (SPIR-V assembly) for dense Q8 + MoE
-   gate/up (25.7% + 25.3% of profiled time).
+1. ~~Cooperative-matrix GEMM prototype for dense Q8~~ — **done**, see above.
+   Remaining: the same treatment for MoE gate/up (26%) and down (14%),
+   which together are twice the dense Q8 share.
 2. Activation-quantized int8 dot product path for dense Q8 (needs a new
    activation quantization kernel upstream of matmul; A8W8 dot is exposed
    by the device).

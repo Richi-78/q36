@@ -3931,9 +3931,10 @@ static bool q36_vk_use_q8_mm_f16(void) {
 }
 
 /* The cooperative shader is opt-in until it has been benchmarked against the
- * packed-f16 baseline on each RADV release. Its two-subgroup tile is
- * correctness-critical on Phoenix; Q36_VK_Q8_MM_CM=1 is a diagnostic and
- * performance switch, not a silent hardware-wide default. */
+ * packed-f16 baseline on each RADV release. It owns a 64-row x 64-token tile
+ * across four subgroups, so the dispatch grid differs from every other q8
+ * variant; tools/cmgemm covers its ragged-edge shapes. Q36_VK_Q8_MM_CM=1 is a
+ * diagnostic and performance switch, not a silent hardware-wide default. */
 static bool q36_vk_use_q8_mm_f16_cm(void) {
     const char *env = getenv("Q36_VK_Q8_MM_CM");
     return q36_vk.have_cooperative_matrix && env && env[0] && env[0] != '0';
@@ -3979,14 +3980,17 @@ static int q36_vk_matmul_q8_0_mm(q36_gpu_tensor *out,
     if (ok) {
         const q36_gpu_tensor *bindings[3] = { weights, x, out };
         const char *op = q36_vk.prof_ops ? q36_vk_q8_0_op_name(out_dim, blocks, n_tok) : "dense_q8_0";
-        int cm = q36_vk_use_q8_mm_f16_cm();
+        /* The cooperative tile is 128 rows deep, so a narrow projection
+         * would leave most of it idle and lose to the specialized kernels
+         * below; keep those for out_dim < 128. */
+        int cm = q36_vk_use_q8_mm_f16_cm() && out_dim >= 128u;
         int f16 = q36_vk_use_q8_mm_f16();
         int out32 = !cm && f16 && out_dim == 32u && q36_vk_use_q8_mm_f16_out32();
         q36_vk_kernel *kernel = cm ? &q36_vk.matmul_q8_0_mm_f16_cm :
                               out32 ? &q36_vk.matmul_q8_0_mm_f16_out32 :
                               f16 ? &q36_vk.matmul_q8_0_mm_f16 :
                                     &q36_vk.matmul_q8_0_mm;
-        uint32_t gx = cm ? (uint32_t)((out_dim + 31u) / 32u) :
+        uint32_t gx = cm ? (uint32_t)((out_dim + 127u) / 128u) :
                       out32 ? 1u :
                       f16 ? (uint32_t)((out_dim + 127u) / 128u) :
                             (uint32_t)((out_dim + 63u) / 64u);

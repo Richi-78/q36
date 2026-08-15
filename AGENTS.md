@@ -33,6 +33,18 @@ new branch "q36/tree/q36-phoenix is psecific for Radeon 780M GFX (codename gfx11
 - Do not run multiple huge model processes concurrently. The instance lock is
   intentional.
 - Prefer short Vulkan smoke tests for build verification.
+- On the 780M (shared memory), run benchmarks inside a memory-capped scope.
+  GPU buffers come out of system RAM, and when TTM cannot satisfy an
+  allocation it swaps buffer objects to shmem; with zram as the only swap
+  that spirals into a global OOM which takes out the desktop session, not
+  just the benchmark. Observed once: `q36-bench invoked oom-killer`,
+  `Free swap = 24kB`, GNOME and the browser killed. Use:
+
+  ```sh
+  systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0 -- ./q36-bench ...
+  ```
+
+  `MemorySwapMax=0` is the important half: it prevents the zram spiral.
 
 ## Layout
 
@@ -67,6 +79,31 @@ new branch "q36/tree/q36-phoenix is psecific for Radeon 780M GFX (codename gfx11
 Use `make` for build validation. Use `make test` for unit/regression tests when a
 model and Vulkan are available. Use live server tests only when intentionally
 testing the API surface.
+
+Benchmark hygiene: the first run after a build is cold and reads ~8% low
+(205.68 cold vs 222.32 warm on the same binary). Discard run 1 and average
+three. When changing a kernel's tile, check the `groups=` column of
+`Q36_VK_PROF_KERNEL=1` — it must not move unless the dispatch grid was
+supposed to change. A grid that no longer matches the shader's `BM` still
+produces correct output (out-of-range rows are guarded) while silently
+running workgroups that do nothing.
+
+### Cooperative-matrix kernels
+
+`vulkan/*_cm.comp` need a glslang with `GL_KHR_cooperative_matrix` and are
+built by an opt-in target, so a stock build never requires one:
+
+```sh
+make q8-cm                    # compiles with $(GLSLC_CM), default: system glslc
+./tools/cmgemm                # correctness vs f64 reference + shipping kernel
+CMGEMM_BENCH=1 ./tools/cmgemm # throughput A/B, no model needed
+```
+
+`GLSLC_CM` is deliberately separate from `GLSLC` so building these does not
+change the compiler used for the other shaders. Do not judge glslang support
+from the version string alone — a Fedora epoch (`11:16.2.0` is epoch 11,
+version 16.2.0) has already been misread here as an ancient version and cost
+a round of unnecessary hand-written SPIR-V.
 
 ## Notes
 - Do not edit local `ds4/` or `llama.cpp/` checkouts. They are ignored and are
