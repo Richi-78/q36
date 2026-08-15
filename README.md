@@ -22,7 +22,8 @@ other validated optimized paths.
 - AMD Radeon 780M integrated graphics / Phoenix APU (`GFX1103`)
 - Linux with Mesa RADV and Vulkan 1.1+
 - 64-lane Vulkan subgroups
-- Approximately 16 GiB unified system/GPU memory
+- Approximately 32 GiB unified system/GPU memory
+- 24Gb allocated to VRAM via GRUB option
 - Leave room for the KV cache and operating system
 
 Verify the active device before benchmarking:
