@@ -2797,13 +2797,12 @@ int q36_gpu_init(void) {
      * emulate correctly rounded f32 fma via int64 bit ops to stay bit-exact
      * against the CPU reference engine, so shaderFloat64 and shaderInt64 are
      * hard requirements (RADV exposes both on the BC-250 target). */
-    /* Any of the cooperative-matrix switches has to bring the extension up,
-     * because the device is created once and the toggles are read later. */
-    const char *cm_q8_env = getenv("Q36_VK_Q8_MM_CM");
-    const char *cm_moe_env = getenv("Q36_VK_MOE_MM_CM");
-    const bool cm_requested =
-        (cm_q8_env && cm_q8_env[0] && cm_q8_env[0] != '0') ||
-        (cm_moe_env && cm_moe_env[0] && cm_moe_env[0] != '0');
+    /* Either cooperative-matrix switch brings the extension up unless
+     * explicitly disabled, because the device is created once and the
+     * toggles are read later. Both default on (GPU-CPU parity confirmed);
+     * =0 opts out. */
+    const bool cm_requested = q36_vk_env_default_on("Q36_VK_Q8_MM_CM") ||
+                              q36_vk_env_default_on("Q36_VK_MOE_MM_CM");
     bool cm_extension = false;
     bool cm_shape = false;
     uint32_t device_ext_count = 0;
@@ -3941,21 +3940,18 @@ static bool q36_vk_use_q8_mm_f16(void) {
            q36_vk_env_default_on("Q36_VK_Q8_MM_F16");
 }
 
-/* The cooperative shaders are opt-in until they have been benchmarked against
- * the packed-f16 baselines on each RADV release. Both own a 128-row tile where
- * the kernel they replace owns 64, so their dispatch grids differ from every
- * other variant - see the gx arithmetic at each call site, and the note in
- * AGENTS.md about checking `groups=` after a tile change. tools/cmgemm covers
- * the dense Q8 ragged-edge shapes. These are diagnostic and performance
- * switches, not silent hardware-wide defaults. */
+/* The cooperative shaders are the default prefill GEMMs on capable hardware
+ * (GPU-CPU parity confirmed). Both own a 128-row tile where the kernel they
+ * replace owns 64, so their dispatch grids differ from every other variant -
+ * see the gx arithmetic at each call site, and the note in AGENTS.md about
+ * checking `groups=` after a tile change. tools/cmgemm covers the dense Q8
+ * ragged-edge shapes. =0 opts out back to the packed-f16 kernels. */
 static bool q36_vk_use_q8_mm_f16_cm(void) {
-    const char *env = getenv("Q36_VK_Q8_MM_CM");
-    return q36_vk.have_cooperative_matrix && env && env[0] && env[0] != '0';
+    return q36_vk.have_cooperative_matrix && q36_vk_env_default_on("Q36_VK_Q8_MM_CM");
 }
 
 static bool q36_vk_use_moe_mm_cm(void) {
-    const char *env = getenv("Q36_VK_MOE_MM_CM");
-    return q36_vk.have_cooperative_matrix && env && env[0] && env[0] != '0';
+    return q36_vk.have_cooperative_matrix && q36_vk_env_default_on("Q36_VK_MOE_MM_CM");
 }
 
 static bool q36_vk_use_q8_mm_f16_out32(void) {

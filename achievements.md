@@ -486,3 +486,19 @@ Mid-experiment the tree briefly lost `l[rr] += w;` through a bad hunk
 (fused-test binary was invalid, timing only). Restored and verified via
 `git diff` clean + rebuild + greedy-diff before measuring. Lesson: attention
 edits get a greedy-diff before any number is trusted.
+
+## 18. CM GEMMs default-on (GPU-CPU parity confirmed)
+
+With user-confirmed `--gpu-cpu-parity`, the two switches flipped to
+default-on in `q36_vulkan.c` (`q36_vk_env_default_on`, hardware
+`have_cooperative_matrix` guard retained, `=0` opts out to packed-f16):
+`Q36_VK_Q8_MM_CM`, `Q36_VK_MOE_MM_CM`, plus the device-extension gating at
+init. Verified on the default path (no env): prefill **350.1** @2k,
+`--vulkan-kernels` OK, `--session-sync-resume` OK exact; `=0` fallback
+prints no CM line and runs 236.5 (packed GEMMs + §17 attention).
+`q36-server-phoenix.sh` keeps explicit `=1` (harmless, documents intent).
+
+Methodology trap confirmed again: first bench after idle hit a cold page
+cache (10.9 GB re-fault: 71 s wall, 290→302 t/s) before recovering to
+350.1 in 14 s. `make`+idle invalidates "warm" — re-warm before trusting
+any number.
