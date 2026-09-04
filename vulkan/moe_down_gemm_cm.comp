@@ -1,0 +1,196 @@
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+/* Routed Q2_K down projection GEMM on KHR cooperative matrices (RDNA3
+ * WMMA). Same 5-binding/24-byte-push interface as moe_down_gemm, so it
+ * drops into the same dispatch slot behind Q36_VK_MOE_MM_CM=1.
+ *
+ * Tile: one 256-thread workgroup owns a 128-out-row x 32-slot tile of one
+ * expert's token group. Four subgroups stack in the row direction, each
+ * owning 32 rows x 32 slots as 2x2 accumulators of the 16x16x16
+ * F16xF16->F32 shape RADV Phoenix reports.
+ *
+ * Why 128 rows and not a wider slot tile: the slot count is fixed at 32 by
+ * the host-side tile schedule (TILE_WORDS = 1 + 32 in q36_vulkan.c), so BN
+ * is not free. It also should not be: the traffic here is lopsided the same
+ * way the dense Q8 GEMM's was. Per k-element a tile streams BM rows of
+ * Q2_K weight (~0.34 B/element) against BN slots of f32 SwiGLU mid state,
+ * so total traffic scales as (0.34/BN + 4/BM) and the mid-state stream
+ * outweighs the weight stream by ~3x at the shipping 64x32 shape. Doubling
+ * BM halves the dominant half. A 128-row tile costs 8 accumulators per
+ * subgroup and ~13 KB of LDS, both well inside the register and LDS budget.
+ *
+ * Numerics: weights already stage fully dequantized as d*sc*q - dmin*m
+ * rounded once to f16 (moe_down_gemm stages exactly the same values), mid
+ * state rounds once to f16, and accumulation runs in f32 inside the
+ * cooperative matrix instead of the 8-term f16 chains the packed kernel
+ * flushes per k-block. That makes this the more accurate of the two. The
+ * per-output k order is the same sequential k-block loop and still does not
+ * depend on n_tok, so the batch-size invariance rule (warm == cold) holds.
+ *
+ * Subgroup size: the tile assumes at least 4 subgroups and guards on
+ * gl_SubgroupID, so wave64 runs 4 full subgroups and wave32 runs the same
+ * tile on subgroups 0-3 with 4-7 idle. Both correct; only wave64 is fast. */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Weights { uint16_t wb[]; };
+layout(set = 0, binding = 1) readonly buffer Mid { vec4 mid[]; };
+layout(set = 0, binding = 2) readonly buffer Tiles { uint tiles[]; };
+layout(set = 0, binding = 3) readonly buffer Scales { float scales[]; };
+layout(set = 0, binding = 4) writeonly buffer Output { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint out_dim;
+    uint in_dim;
+    uint blocks;
+    uint n_used;
+    uint has_scales;
+    uint pad;
+} pc;
+
+/* One Q2_K superblock is 42 uint16 words:
+ * [8 x scales][32 x qs][dm.x f16][dm.y f16]. */
+const uint Q2K_U16 = 42u;
+const uint SLOT_TILE = 32u;
+const uint TILE_WORDS = 1u + SLOT_TILE;
+const uint INVALID = 0xffffffffu;
+const uint BM = 128u;
+const uint BN = SLOT_TILE;
+const uint BK = 32u;
+/* Row strides carry an 8-element pad so the 16-wide cooperative loads do
+ * not land every fragment row on the same LDS banks. */
+const uint SA = BK + 8u;
+const uint SB = BN + 8u;
+
+shared float16_t As[BM * SA];
+shared float16_t Bs[BK * SB];
+/* Ragged-edge drain only: one 16x16 f32 staging tile per subgroup. */
+shared float Cs[4u * 256u];
+shared uint sh_slot[SLOT_TILE];
+
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define FRAG_A coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define FRAG_B coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+
+void main(void) {
+    uint tid = gl_LocalInvocationID.x;
+    uint row0 = gl_WorkGroupID.x * BM;
+    uint tile_base = gl_WorkGroupID.y * TILE_WORDS;
+    uint expert = tiles[tile_base];
+    if (expert == INVALID) return;
+
+    if (tid < SLOT_TILE) sh_slot[tid] = tiles[tile_base + 1u + tid];
+
+    uint row_u16 = pc.blocks * Q2K_U16;
+    uint ar = tid >> 2u;      /* staged row 0..63, repeated for 64..127 */
+    uint sub = tid & 3u;      /* 8-element group within the 32-block */
+    uint bc = tid >> 3u;      /* staged slot 0..31 */
+    uint bkk = tid & 7u;      /* f16vec4 of k within the 32-block */
+    uint mid4 = pc.in_dim / 4u;
+    uint sgid = gl_SubgroupID;
+
+    ACC acc[2][2];
+    for (uint i = 0u; i < 2u; i++)
+        for (uint j = 0u; j < 2u; j++) acc[i][j] = ACC(0.0);
+
+    barrier();
+
+    uint n_kb = pc.blocks * 8u;
+    for (uint kb = 0u; kb < n_kb; kb++) {
+        uint sb = kb >> 3u;
+        uint half_ = (kb >> 2u) & 1u;   /* 128-element half of the superblock */
+        uint j2 = kb & 3u;              /* 2-bit shift within the half */
+        /* Stage A: 128 rows x one 32-element k-block, 8 elements per thread
+         * per repeat. Element n = 128*half + 32*j2 + l uses qs byte l of the
+         * half at shift 2*j2, scale group n >> 4. */
+        for (uint rep = 0u; rep < 2u; rep++) {
+            uint sr = ar + rep * 64u;
+            uint row = row0 + sr;
+            bool live = row < pc.out_dim;
+            uint bb = (expert * pc.out_dim + (live ? row : 0u)) * row_u16 + sb * Q2K_U16;
+            vec2 dm = unpackHalf2x16(uint(wb[bb + 40u]) | (uint(wb[bb + 41u]) << 16u));
+            uint g = 8u * half_ + 2u * j2 + (sub >> 1u);
+            uint scw = (uint(wb[bb + (g >> 1u)]) >> (8u * (g & 1u))) & 255u;
+            float sc1 = dm.x * float(scw & 0xFu);
+            float sc2 = dm.y * float((scw >> 4u) & 0xFu);
+            uint q0w = bb + 8u + 16u * half_ + sub * 4u;
+            uint p0 = uint(wb[q0w + 0u]) | (uint(wb[q0w + 1u]) << 16u);
+            uint p1 = uint(wb[q0w + 2u]) | (uint(wb[q0w + 3u]) << 16u);
+            f16vec4 v0 = f16vec4(vec4(unpack8((p0 >> (2u * j2)) & 0x03030303u)) * sc1 - sc2);
+            f16vec4 v1 = f16vec4(vec4(unpack8((p1 >> (2u * j2)) & 0x03030303u)) * sc1 - sc2);
+            uint o = sr * SA + sub * 8u;
+            As[o + 0u] = v0.x;
+            As[o + 1u] = v0.y;
+            As[o + 2u] = v0.z;
+            As[o + 3u] = v0.w;
+            As[o + 4u] = v1.x;
+            As[o + 5u] = v1.y;
+            As[o + 6u] = v1.z;
+            As[o + 7u] = v1.w;
+        }
+        /* Stage B transposed to [k][slot] so the B fragment loads row-major. */
+        {
+            uint slot = sh_slot[bc];
+            f16vec4 b = slot != INVALID ? f16vec4(mid[slot * mid4 + kb * 8u + bkk])
+                                        : f16vec4(0.0hf);
+            uint k0 = bkk * 4u;
+            Bs[(k0 + 0u) * SB + bc] = b.x;
+            Bs[(k0 + 1u) * SB + bc] = b.y;
+            Bs[(k0 + 2u) * SB + bc] = b.z;
+            Bs[(k0 + 3u) * SB + bc] = b.w;
+        }
+        barrier();
+
+        if (sgid < 4u) {
+            for (uint kk = 0u; kk < 2u; kk++) {
+                FRAG_A a[2];
+                FRAG_B b[2];
+                for (uint i = 0u; i < 2u; i++)
+                    coopMatLoad(a[i], As, (sgid * 32u + i * 16u) * SA + kk * 16u, SA,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                for (uint j = 0u; j < 2u; j++)
+                    coopMatLoad(b[j], Bs, (kk * 16u) * SB + j * 16u, SB,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                for (uint i = 0u; i < 2u; i++)
+                    for (uint j = 0u; j < 2u; j++)
+                        acc[i][j] = coopMatMulAdd(a[i], b[j], acc[i][j]);
+            }
+        }
+        barrier();
+    }
+
+    float sc = pc.has_scales != 0u ? scales[expert] : 1.0;
+
+    /* Drain through LDS, always. The dense Q8 kernel can store an interior
+     * fragment straight to global because its 16 output columns are 16
+     * consecutive tokens; here a tile's 32 columns are arbitrary routed slot
+     * indices, so no fragment is contiguous in y and there is no interior
+     * fast path to have. The cost is 1024 f32 of LDS traffic per workgroup
+     * against a k loop of in_dim/32 iterations, so it does not matter.
+     * Barriers stay outside the subgroup guard to keep them uniform. */
+    for (uint i = 0u; i < 2u; i++) {
+        for (uint j = 0u; j < 2u; j++) {
+            if (sgid < 4u)
+                coopMatStore(acc[i][j], Cs, sgid * 256u, 16u,
+                             gl_CooperativeMatrixLayoutRowMajor);
+            barrier();
+            for (uint e = 0u; e < 4u; e++) {
+                uint idx = tid + 256u * e;
+                uint sg = idx >> 8u;
+                uint el = idx & 255u;
+                uint row = row0 + sg * 32u + i * 16u + (el >> 4u);
+                uint slot = sh_slot[j * 16u + (el & 15u)];
+                if (row < pc.out_dim && slot != INVALID)
+                    y[slot * pc.out_dim + row] = Cs[sg * 256u + el] * sc;
+            }
+            barrier();
+        }
+    }
+}

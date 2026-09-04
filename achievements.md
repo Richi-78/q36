@@ -376,3 +376,65 @@ hand-rolled packed-f16 inner loop). The dequant staging is reusable as-is; only
 the inner loop changes. Note those kernels stage from IQ2_XXS and Q2_K rather
 than Q8_0, and their B operand is already a routed token tile, so the traffic
 arithmetic that picked 128x64 here has to be redone for them.
+
+## 16. Cooperative-matrix MoE GEMMs — measured, +45% prefill, opt-in
+
+The uncommitted MoE CM work (`vulkan/moe_gate_up_gemm_cm.comp`,
+`vulkan/moe_down_gemm_cm.comp`, dispatch via `Q36_VK_MOE_MM_CM` in
+`q36_vulkan.c`, `make q8-cm` builds all three) was benchmarked as-is.
+Same 2048-token bench as §15, three warm runs each (run 1 discarded):
+
+| | run 1 | run 2 | run 3 | run 4 | avg (2-4) |
+|---|---:|---:|---:|---:|---:|
+| baseline | 225.72 | 225.14 | 224.41 | 224.12 | **224.56** |
+| `Q36_VK_Q8_MM_CM=1 Q36_VK_MOE_MM_CM=1` | 326.90 | 326.48 | 326.65 | 326.83 | **326.65** |
+
+**+45.5% prefill**, generation unchanged (~24.5 t/s). Per-kernel GPU time
+(2048 ctx, `Q36_VK_PROF_KERNEL=1`):
+
+| op | before (§15) | with CM | speedup |
+|---|---:|---:|---:|
+| `moe_iq2_gate_up_gemm` | 4874 ms | 1870 ms | 2.6x |
+| `moe_q2k_down_gemm` | 2680 ms | 1108 ms | 2.4x |
+| dense Q8 total | 4857 ms | ~3456 ms | 1.4x |
+
+MoE CM beats the dense-CM ratio because the baseline MoE kernels were
+further from the traffic roof (IQ2_XXS/Q2_K dequant + f16 accumulation
+chains); f32 WMMA accumulation plus the halved 128-row dispatch grid
+removed both. The 128-row tile with `(dim+127)/128` grid is confirmed in
+the profile (`moe_iq2_gate_up_gemm_cm`, `moe_q2k_down_gemm_cm` dispatch
+under those names).
+
+### Correctness (all with both CM switches on)
+
+- `./q36_test --vulkan-kernels`: OK; routed `gemm_max_rel` 0.00895 → 0.00507
+  (CM more accurate, same direction as dense in §15).
+- `tools/cmgemm` dense shapes: OK (unchanged).
+- `--session-sync-resume`: OK, exact (`rms=0 max_abs=0`, top64 64/64).
+- `--vulkan-fusion-parity`: OK (top1 match, rms ~1.2e-5).
+- `--ssd-streaming-parity`: OK, exact on cold-pressure and full-layer.
+- Greedy CLI (`--temp 0 -n 20`) on `long_memory_archive.txt` (~4k-token
+  prefill): byte-identical output vs baseline; prefill 203.5 → 282.7 t/s
+  on that prompt too.
+- `--gpu-cpu-parity`: still blocked on the CPU side (30-min timeout in
+  `long_*` CPU capture, same as §15). Pre-existing harness slowness, not a
+  CM signal; stays the gate before default-on.
+
+### Retuning with CM on — no change
+
+- Prefill chunk (2048 ctx): 512 → 300, 1024 → 327, 2048 → ~106 (same
+  collapse as §1). **1024 stays.**
+- `Q36_VK_MOE_GEMM_MIN` 64/128/256: interleaved runs show no separation
+  (327.2 vs 327.5 after cooldown); an apparent +0.4% for 64 did not
+  reproduce. **128 stays.**
+- Sustained back-to-back benching throttles this APU (316 → 286 → 327
+  across four consecutive runs, gen tok/s dipping with it). Interleave
+  configs and cool down before trusting <1% deltas.
+
+### Where prefill goes next
+
+8k-ctx profile with CM on (`--ctx-start 8192 --ctx-max 8192`, 200.6 t/s):
+`attn_prefill_qtile2` is 40.7 s = **50.0%** of GPU time (2.2 s at 2k → 40.7 s
+at 8k, ~quadratic as expected); MoE CM total ~11.8 s, dense Q8 ~9.2 s.
+Attention is now the prefill bottleneck at length. The GEMM family is done;
+`attn_prefill_qtile2`/`attn_combine` is the next kernel project.

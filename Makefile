@@ -143,6 +143,12 @@ GLSLC_CM ?= glslc
 vulkan/matmul_q8_0_mm_f16_cm.spv: vulkan/matmul_q8_0_mm_f16_cm.comp
 	$(GLSLC_CM) -O --target-env=vulkan1.3 -o $@ $<
 
+vulkan/moe_down_gemm_cm.spv: vulkan/moe_down_gemm_cm.comp
+	$(GLSLC_CM) -O --target-env=vulkan1.3 -o $@ $<
+
+vulkan/moe_gate_up_gemm_cm.spv: vulkan/moe_gate_up_gemm_cm.comp
+	$(GLSLC_CM) -O --target-env=vulkan1.3 -o $@ $<
+
 vulkan/matmul_q8_0_f32b_nx.spv: vulkan/matmul_q8_0_f32b_nx.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
@@ -200,7 +206,7 @@ help:
 	@echo "  make              Build generic Vulkan with automatic BC-250 fast-path selection (default)"
 	@echo "  make vulkan-generic  Build generic Vulkan for runtime capability detection"
 	@echo "  make vulkan-bc250    Build Vulkan and require an AMD BC-250 at runtime"
-	@echo "  make q8-cm          Assemble the opt-in cooperative-matrix Q8 GEMM prototype"
+	@echo "  make q8-cm          Build the opt-in cooperative-matrix GEMM prototypes"
 	@echo "  make metal        Build the same binaries with the Metal backend (macOS)"
 	@echo "  make test-metal   Build Metal and run its model-independent unit and kernel tests"
 	@echo "  make test-metal-model  Run Metal model, parity, streaming, and state tests"
@@ -226,7 +232,7 @@ vulkan-generic:
 vulkan-bc250:
 	$(MAKE) -B all VULKAN_CFLAGS=-DQ36_VULKAN_REQUIRE_BC250
 
-q8-cm: vulkan/matmul_q8_0_mm_f16_cm.spv
+q8-cm: vulkan/matmul_q8_0_mm_f16_cm.spv vulkan/moe_down_gemm_cm.spv vulkan/moe_gate_up_gemm_cm.spv
 
 metal: q36_cli_metal.o q36_server.o q36_bench.o q36_agent.o q36_eval.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o rax.o q36_test_metal.o q36_gpu_core_metal_test.o $(METAL_CORE_OBJS)
 	$(CC) $(METAL_LDFLAGS) -o q36 q36_cli_metal.o q36_ssd.o linenoise.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)

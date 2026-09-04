@@ -189,3 +189,5 @@ Next candidates to attack first (ranked by measured GPU share and risk):
    with context; fp32 score/value chains are the likely cost).
 4. Memory-clock sampling during benchmarks (`watch` sysfs hwmon) to check
    whether the shared-DDR5 ceiling is hit at higher context lengths.
+   
+5. MoE gate_up (26%) + down (14%) are twice the dense-Q8 share and have identical structure — that's where the remaining prefill gap to llama.cpp mostly lives.

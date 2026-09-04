@@ -195,6 +195,8 @@ typedef struct {
     q36_vk_kernel moe_down_q4k_sum_decode;
     q36_vk_kernel moe_gate_up_gemm;
     q36_vk_kernel moe_down_gemm;
+    q36_vk_kernel moe_down_gemm_cm;
+    q36_vk_kernel moe_gate_up_gemm_cm;
     q36_vk_kernel moe_matvec;
     q36_vk_kernel moe_matvec_fast;
     q36_vk_kernel moe_reduce;
@@ -2671,6 +2673,8 @@ int q36_gpu_init(void) {
     q36_vk.moe_down_q4k_sum_decode = Q36_VK_KERNEL("vulkan/moe_down_q4k_sum_decode.spv", 6, 24, 1u << 5);
     q36_vk.moe_gate_up_gemm = Q36_VK_KERNEL("vulkan/moe_gate_up_gemm.spv", 8, 24, 1u << 6);
     q36_vk.moe_down_gemm = Q36_VK_KERNEL("vulkan/moe_down_gemm.spv", 5, 24, 1u << 4);
+    q36_vk.moe_down_gemm_cm = Q36_VK_KERNEL("vulkan/moe_down_gemm_cm.spv", 5, 24, 1u << 4);
+    q36_vk.moe_gate_up_gemm_cm = Q36_VK_KERNEL("vulkan/moe_gate_up_gemm_cm.spv", 8, 24, 1u << 6);
     q36_vk.moe_matvec = Q36_VK_KERNEL("vulkan/moe_matvec.spv", 6, 36, 1u << 4);
     q36_vk.moe_matvec_fast = Q36_VK_KERNEL("vulkan/moe_matvec_fast.spv", 6, 36, 1u << 4);
     q36_vk.moe_reduce = Q36_VK_KERNEL("vulkan/moe_reduce.spv", 3, 8, 1u << 2);
@@ -2793,8 +2797,13 @@ int q36_gpu_init(void) {
      * emulate correctly rounded f32 fma via int64 bit ops to stay bit-exact
      * against the CPU reference engine, so shaderFloat64 and shaderInt64 are
      * hard requirements (RADV exposes both on the BC-250 target). */
-    const char *cm_env = getenv("Q36_VK_Q8_MM_CM");
-    const bool cm_requested = cm_env && cm_env[0] && cm_env[0] != '0';
+    /* Any of the cooperative-matrix switches has to bring the extension up,
+     * because the device is created once and the toggles are read later. */
+    const char *cm_q8_env = getenv("Q36_VK_Q8_MM_CM");
+    const char *cm_moe_env = getenv("Q36_VK_MOE_MM_CM");
+    const bool cm_requested =
+        (cm_q8_env && cm_q8_env[0] && cm_q8_env[0] != '0') ||
+        (cm_moe_env && cm_moe_env[0] && cm_moe_env[0] != '0');
     bool cm_extension = false;
     bool cm_shape = false;
     uint32_t device_ext_count = 0;
@@ -2876,7 +2885,7 @@ int q36_gpu_init(void) {
     q36_vk.have_cooperative_matrix = cm_requested && cm_extension && cm_shape &&
                                      cm_query.cooperativeMatrix && q36_vk.have_f16;
     if (q36_vk.have_cooperative_matrix) {
-        fprintf(stderr, "q36: cooperative matrix Q8 prototype available (16x16x16 F16/F16->F32)\n");
+        fprintf(stderr, "q36: cooperative matrix prototypes available (16x16x16 F16/F16->F32)\n");
     }
     VkPhysicalDeviceFeatures enabled = { .shaderFloat64 = VK_TRUE, .shaderInt64 = VK_TRUE };
     VkPhysicalDevice16BitStorageFeatures storage16_enable = {
@@ -3056,6 +3065,8 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.moe_down_q4k_sum_decode);
     q36_vk_kernel_destroy(&q36_vk.moe_gate_up_gemm);
     q36_vk_kernel_destroy(&q36_vk.moe_down_gemm);
+    q36_vk_kernel_destroy(&q36_vk.moe_down_gemm_cm);
+    q36_vk_kernel_destroy(&q36_vk.moe_gate_up_gemm_cm);
     q36_vk_kernel_destroy(&q36_vk.attn_decode_fused);
     q36_vk_kernel_destroy(&q36_vk.attn_decode_split);
     q36_vk_kernel_destroy(&q36_vk.attn_prefill_qtile);
@@ -3930,13 +3941,20 @@ static bool q36_vk_use_q8_mm_f16(void) {
            q36_vk_env_default_on("Q36_VK_Q8_MM_F16");
 }
 
-/* The cooperative shader is opt-in until it has been benchmarked against the
- * packed-f16 baseline on each RADV release. It owns a 64-row x 64-token tile
- * across four subgroups, so the dispatch grid differs from every other q8
- * variant; tools/cmgemm covers its ragged-edge shapes. Q36_VK_Q8_MM_CM=1 is a
- * diagnostic and performance switch, not a silent hardware-wide default. */
+/* The cooperative shaders are opt-in until they have been benchmarked against
+ * the packed-f16 baselines on each RADV release. Both own a 128-row tile where
+ * the kernel they replace owns 64, so their dispatch grids differ from every
+ * other variant - see the gx arithmetic at each call site, and the note in
+ * AGENTS.md about checking `groups=` after a tile change. tools/cmgemm covers
+ * the dense Q8 ragged-edge shapes. These are diagnostic and performance
+ * switches, not silent hardware-wide defaults. */
 static bool q36_vk_use_q8_mm_f16_cm(void) {
     const char *env = getenv("Q36_VK_Q8_MM_CM");
+    return q36_vk.have_cooperative_matrix && env && env[0] && env[0] != '0';
+}
+
+static bool q36_vk_use_moe_mm_cm(void) {
+    const char *env = getenv("Q36_VK_MOE_MM_CM");
     return q36_vk.have_cooperative_matrix && env && env[0] && env[0] != '0';
 }
 
@@ -7311,8 +7329,14 @@ int q36_gpu_moe_ffn_f32_tensor(q36_gpu_tensor *out,
                 ok = q36_vk_run_unlocked("moe_q4k_gate_up", &q36_vk.moe_gate_up_q4k_f32b, qgb, &gpush, sizeof(gpush),
                                          mid_dim, wave_tile_count, 1);
             } else {
-                ok = gemm ? q36_vk_run_unlocked("moe_iq2_gate_up_gemm", &q36_vk.moe_gate_up_gemm, gb, &gpush, sizeof(gpush),
-                                                (mid_dim + 63u) / 64u, wave_tile_count, 1)
+                /* Same 128-row tile as the down variant, so the same
+                 * halved dispatch grid. */
+                bool gcm = q36_vk_use_moe_mm_cm();
+                ok = gemm ? q36_vk_run_unlocked(gcm ? "moe_iq2_gate_up_gemm_cm" : "moe_iq2_gate_up_gemm",
+                                                gcm ? &q36_vk.moe_gate_up_gemm_cm : &q36_vk.moe_gate_up_gemm,
+                                                gb, &gpush, sizeof(gpush),
+                                                gcm ? (mid_dim + 127u) / 128u : (mid_dim + 63u) / 64u,
+                                                wave_tile_count, 1)
                           : q36_vk_run_unlocked(identity ? "moe_iq2_gate_up_decode" : "moe_iq2_gate_up",
                                                 identity ? &q36_vk.moe_gate_up_decode : &q36_vk.moe_gate_up_f32b,
                                                 gb, &gpush, sizeof(gpush), mid_dim, wave_tile_count, 1);
@@ -7345,8 +7369,16 @@ int q36_gpu_moe_ffn_f32_tensor(q36_gpu_tensor *out,
                     down_scales ? down_scales : down_bank,
                     down8,
                 };
-                ok = gemm ? q36_vk_run_unlocked("moe_q2k_down_gemm", &q36_vk.moe_down_gemm, db, &dpush, sizeof(dpush),
-                                                (out_dim + 63u) / 64u, wave_tile_count, 1)
+                /* The cooperative variant owns a 128-row tile, so it needs
+                 * half the workgroups; dispatching the 64-row grid at it
+                 * still produces correct output (rows past the tile are
+                 * guarded) while silently running half the workgroups empty. */
+                bool dcm = q36_vk_use_moe_mm_cm();
+                ok = gemm ? q36_vk_run_unlocked(dcm ? "moe_q2k_down_gemm_cm" : "moe_q2k_down_gemm",
+                                                dcm ? &q36_vk.moe_down_gemm_cm : &q36_vk.moe_down_gemm,
+                                                db, &dpush, sizeof(dpush),
+                                                dcm ? (out_dim + 127u) / 128u : (out_dim + 63u) / 64u,
+                                                wave_tile_count, 1)
                           : q36_vk_run_unlocked("moe_q2k_down", &q36_vk.moe_down_q2k_f32b, db, &dpush, sizeof(dpush),
                                                 out_dim, wave_tile_count, 1);
             }

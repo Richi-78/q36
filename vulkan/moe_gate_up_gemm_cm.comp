@@ -1,0 +1,244 @@
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+/* Routed IQ2_XXS gate/up/SwiGLU GEMM on KHR cooperative matrices (RDNA3
+ * WMMA). Same 8-binding/24-byte-push interface as moe_gate_up_gemm, so it
+ * drops into the same dispatch slot behind Q36_VK_MOE_MM_CM=1.
+ *
+ * Tile: one 256-thread workgroup owns a 128-mid-row x 32-slot tile of one
+ * expert's token group. Four subgroups stack in the row direction, each
+ * owning 32 rows x 32 slots as 2x2 accumulators per projection - eight
+ * accumulators in all, since gate and up share the staged activation tile
+ * and only differ in their weight operand.
+ *
+ * Why 128 rows: the slot count is pinned at 32 by the host tile schedule
+ * (TILE_WORDS = 1 + 32 in q36_vulkan.c), so BN is not a free parameter, and
+ * it should not be. Traffic here scales as (2*0.26/BN + 4/BM) bytes per
+ * k-element - two IQ2_XXS weight rows at ~0.26 B/element against one f32
+ * activation column - so the activation stream outweighs both weight
+ * streams by ~4x at the shipping 64x32 shape and BM is the lever, exactly
+ * as it was for the dense Q8 GEMM.
+ *
+ * Numerics, and the one real difference from moe_gate_up_gemm: a
+ * cooperative accumulator has no addressable row index, so the per-row
+ * group scale cannot be applied after the multiply the way the packed
+ * kernel applies Dg/Du. It is folded into the staged f16 weight instead.
+ * That trades one error for another: the packed kernel stages A exactly
+ * (grid * 2^-6 with |grid| <= 43 is exact in f16) and then accumulates
+ * 8-term f16 chains, while this one rounds A once to f16 (~5e-4 relative)
+ * and accumulates entirely in f32. Range is safe - the folded product peaks
+ * at 0.672 * 248 * d, far under the f16 maximum - but rows whose block
+ * scale d is below ~5e-4 push their smallest products into f16 subnormals
+ * and lose relative precision there. Those rows contribute proportionally
+ * little, and both parity gates pass; see achievements.md section 16.
+ *
+ * Per-output k order is the sequential k-block loop and does not depend on
+ * n_tok, so the batch-size invariance rule (warm == cold) still holds.
+ *
+ * Subgroup size: the tile assumes at least 4 subgroups and guards on
+ * gl_SubgroupID, so wave64 runs 4 full subgroups and wave32 runs the same
+ * tile on subgroups 0-3 with 4-7 idle. Both correct; only wave64 is fast. */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer GateWeights { uint16_t gw[]; };
+layout(set = 0, binding = 1) readonly buffer UpWeights { uint16_t uw[]; };
+layout(set = 0, binding = 2) readonly buffer X { vec4 xv[]; };
+layout(set = 0, binding = 3) readonly buffer Tiles { uint tiles[]; };
+layout(set = 0, binding = 4) readonly buffer GateScales { float gate_scales[]; };
+layout(set = 0, binding = 5) readonly buffer UpScales { float up_scales[]; };
+layout(set = 0, binding = 6) writeonly buffer Output { float y[]; };
+layout(set = 0, binding = 7) readonly buffer Tables { uint tables[]; };
+
+layout(push_constant) uniform Push {
+    uint mid_dim;
+    uint blocks;
+    uint n_used;
+    uint has_gate_scales;
+    uint has_up_scales;
+    uint pad;
+} pc;
+
+/* One IQ2_XXS superblock is 33 uint16 words: [d_f16][32 x qs words]. */
+const uint IQ2_U16 = 33u;
+const uint SLOT_TILE = 32u;
+const uint TILE_WORDS = 1u + SLOT_TILE;
+const uint INVALID = 0xffffffffu;
+const uint BM = 128u;
+const uint BN = SLOT_TILE;
+const uint BK = 32u;
+/* Row strides carry an 8-element pad so the 16-wide cooperative loads do
+ * not land every fragment row on the same LDS banks. */
+const uint SA = BK + 8u;
+const uint SB = BN + 8u;
+
+shared uint sh_grid[512];
+shared float16_t Ag[BM * SA];
+shared float16_t Au[BM * SA];
+shared float16_t Bs[BK * SB];
+/* Output drain only, reused for gate and then up. */
+shared float Cs[4u * 256u];
+shared uint sh_slot[SLOT_TILE];
+shared uint sh_x4[SLOT_TILE];
+
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define FRAG_A coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define FRAG_B coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+
+void main(void) {
+    uint tid = gl_LocalInvocationID.x;
+    uint row0 = gl_WorkGroupID.x * BM;
+    uint tile_base = gl_WorkGroupID.y * TILE_WORDS;
+    uint expert = tiles[tile_base];
+    if (expert == INVALID) return;
+
+    if (tid < SLOT_TILE) {
+        uint slot = tiles[tile_base + 1u + tid];
+        sh_slot[tid] = slot;
+        sh_x4[tid] = (slot != INVALID ? slot / pc.n_used : 0u) * pc.blocks * 64u;
+    }
+    for (uint w = tid; w < 512u; w += 256u) sh_grid[w] = tables[w];
+
+    uint row_u16 = pc.blocks * IQ2_U16;
+    uint ar = tid >> 2u;      /* staged row 0..63, repeated for 64..127 */
+    uint sub = tid & 3u;      /* 8-element group within the 32-block */
+    uint bc = tid >> 3u;      /* staged slot 0..31 */
+    uint bkk = tid & 7u;      /* f16vec4 of k within the 32-block */
+    uint sgid = gl_SubgroupID;
+
+    ACC accg[2][2];
+    ACC accu[2][2];
+    for (uint i = 0u; i < 2u; i++) {
+        for (uint j = 0u; j < 2u; j++) {
+            accg[i][j] = ACC(0.0);
+            accu[i][j] = ACC(0.0);
+        }
+    }
+    barrier();
+
+    uint n_kb = pc.blocks * 8u;
+    for (uint kb = 0u; kb < n_kb; kb++) {
+        uint sb = kb >> 3u;
+        uint ib32 = kb & 7u;
+        /* Stage gate and up: 128 rows x one 32-element scale group, one
+         * 8-element grid word per thread per repeat, with the group scale
+         * folded in so the cooperative multiply needs no per-row fixup. */
+        for (uint rep = 0u; rep < 2u; rep++) {
+            uint sr = ar + rep * 64u;
+            uint row = row0 + sr;
+            bool live = row < pc.mid_dim;
+            uint gb = (expert * pc.mid_dim + (live ? row : 0u)) * row_u16 + sb * IQ2_U16;
+            uint gq = gb + 1u + 4u * ib32;
+            uint gss = uint(gw[gq + 2u]) | (uint(gw[gq + 3u]) << 16u);
+            uint uss = uint(uw[gq + 2u]) | (uint(uw[gq + 3u]) << 16u);
+            uint gqs = (uint(gw[gq + (sub >> 1u)]) >> (8u * (sub & 1u))) & 255u;
+            uint uqs = (uint(uw[gq + (sub >> 1u)]) >> (8u * (sub & 1u))) & 255u;
+            uint sbit = 7u * sub;
+
+            /* 0.015625 is the 2^-6 grid scale the packed kernel also uses;
+             * the rest is the same d * 0.25 * (0.5 + ls) * 64 group scale. */
+            float gd = unpackHalf2x16(uint(gw[gb])).x;
+            float ud = unpackHalf2x16(uint(uw[gb])).x;
+            float gk = gd * 0.25 * (0.5 + float(gss >> 28u)) * 64.0 * 0.015625;
+            float uk = ud * 0.25 * (0.5 + float(uss >> 28u)) * 64.0 * 0.015625;
+
+            uint gsign = bitfieldExtract(gss, int(sbit), 7);
+            vec4 g0 = vec4(unpack8(sh_grid[gqs * 2u]));
+            vec4 g1 = vec4(unpack8(sh_grid[gqs * 2u + 1u]));
+            g0 = mix(g0, -g0, bvec4((gsign & 1u) != 0u, (gsign & 2u) != 0u, (gsign & 4u) != 0u, (gsign & 8u) != 0u));
+            g1 = mix(g1, -g1, bvec4((gsign & 16u) != 0u, (gsign & 32u) != 0u, (gsign & 64u) != 0u, (bitCount(gsign) & 1) != 0));
+
+            uint usign = bitfieldExtract(uss, int(sbit), 7);
+            vec4 u0 = vec4(unpack8(sh_grid[uqs * 2u]));
+            vec4 u1 = vec4(unpack8(sh_grid[uqs * 2u + 1u]));
+            u0 = mix(u0, -u0, bvec4((usign & 1u) != 0u, (usign & 2u) != 0u, (usign & 4u) != 0u, (usign & 8u) != 0u));
+            u1 = mix(u1, -u1, bvec4((usign & 16u) != 0u, (usign & 32u) != 0u, (usign & 64u) != 0u, (bitCount(usign) & 1) != 0));
+
+            f16vec4 gv0 = f16vec4(g0 * gk);
+            f16vec4 gv1 = f16vec4(g1 * gk);
+            f16vec4 uv0 = f16vec4(u0 * uk);
+            f16vec4 uv1 = f16vec4(u1 * uk);
+
+            uint o = sr * SA + sub * 8u;
+            Ag[o + 0u] = gv0.x; Ag[o + 1u] = gv0.y; Ag[o + 2u] = gv0.z; Ag[o + 3u] = gv0.w;
+            Ag[o + 4u] = gv1.x; Ag[o + 5u] = gv1.y; Ag[o + 6u] = gv1.z; Ag[o + 7u] = gv1.w;
+            Au[o + 0u] = uv0.x; Au[o + 1u] = uv0.y; Au[o + 2u] = uv0.z; Au[o + 3u] = uv0.w;
+            Au[o + 4u] = uv1.x; Au[o + 5u] = uv1.y; Au[o + 6u] = uv1.z; Au[o + 7u] = uv1.w;
+        }
+        /* Stage B transposed to [k][slot] so the B fragment loads row-major. */
+        {
+            bool live = sh_slot[bc] != INVALID;
+            f16vec4 b = live ? f16vec4(xv[sh_x4[bc] + kb * 8u + bkk]) : f16vec4(0.0hf);
+            uint k0 = bkk * 4u;
+            Bs[(k0 + 0u) * SB + bc] = b.x;
+            Bs[(k0 + 1u) * SB + bc] = b.y;
+            Bs[(k0 + 2u) * SB + bc] = b.z;
+            Bs[(k0 + 3u) * SB + bc] = b.w;
+        }
+        barrier();
+
+        if (sgid < 4u) {
+            for (uint kk = 0u; kk < 2u; kk++) {
+                FRAG_B b[2];
+                for (uint j = 0u; j < 2u; j++)
+                    coopMatLoad(b[j], Bs, (kk * 16u) * SB + j * 16u, SB,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                for (uint i = 0u; i < 2u; i++) {
+                    FRAG_A ga, ua;
+                    uint off = (sgid * 32u + i * 16u) * SA + kk * 16u;
+                    coopMatLoad(ga, Ag, off, SA, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(ua, Au, off, SA, gl_CooperativeMatrixLayoutRowMajor);
+                    for (uint j = 0u; j < 2u; j++) {
+                        accg[i][j] = coopMatMulAdd(ga, b[j], accg[i][j]);
+                        accu[i][j] = coopMatMulAdd(ua, b[j], accu[i][j]);
+                    }
+                }
+            }
+        }
+        barrier();
+    }
+
+    float gsc = pc.has_gate_scales != 0u ? gate_scales[expert] : 1.0;
+    float usc = pc.has_up_scales != 0u ? up_scales[expert] : 1.0;
+
+    /* Drain through LDS: a tile's 32 columns are arbitrary routed slot
+     * indices, so no fragment is contiguous in y and there is no interior
+     * cooperative-store path to have. Cs is reused for gate and then up so
+     * the drain costs 4 KB of LDS rather than 8; the gate half lives in
+     * registers across the second store. Barriers stay outside the subgroup
+     * guard to keep them uniform. */
+    for (uint i = 0u; i < 2u; i++) {
+        for (uint j = 0u; j < 2u; j++) {
+            if (sgid < 4u)
+                coopMatStore(accg[i][j], Cs, sgid * 256u, 16u,
+                             gl_CooperativeMatrixLayoutRowMajor);
+            barrier();
+            float gvals[4];
+            for (uint e = 0u; e < 4u; e++) gvals[e] = Cs[tid + 256u * e];
+            barrier();
+            if (sgid < 4u)
+                coopMatStore(accu[i][j], Cs, sgid * 256u, 16u,
+                             gl_CooperativeMatrixLayoutRowMajor);
+            barrier();
+            for (uint e = 0u; e < 4u; e++) {
+                uint idx = tid + 256u * e;
+                uint sg = idx >> 8u;
+                uint el = idx & 255u;
+                uint row = row0 + sg * 32u + i * 16u + (el >> 4u);
+                uint slot = sh_slot[j * 16u + (el & 15u)];
+                if (row < pc.mid_dim && slot != INVALID) {
+                    float g = gvals[e] * gsc;
+                    float v = Cs[idx] * usc;
+                    y[slot * pc.mid_dim + row] = (g / (1.0f + exp(-g))) * v;
+                }
+            }
+            barrier();
+        }
+    }
+}
