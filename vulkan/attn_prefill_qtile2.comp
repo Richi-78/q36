@@ -3,6 +3,7 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 /* Two 64-lane row groups serve two tokens and eight GQA heads. Each group
  * owns one token; each lane owns four output dimensions. */
@@ -200,9 +201,20 @@ void main(void) {
                     nm[rr] = m[rr];
                     continue;
                 }
+                /* One element per lane + subgroup reduce: the 64 lanes of a
+                 * row group are one wave64 subgroup, so this replaces the
+                 * 64x-redundant full-row scan. max() on finite values is
+                 * order-independent, hence bit-identical. Other subgroup
+                 * sizes keep the serial scan. */
                 float tmax = -3.402823466e38;
-                for (uint t = 0u; t < row_tile_n; t++)
-                    tmax = max(tmax, sh_w[r * TILE + t]);
+                if (gl_SubgroupSize == 64u) {
+                    for (uint t = lane; t < row_tile_n; t += 64u)
+                        tmax = max(tmax, sh_w[r * TILE + t]);
+                    tmax = subgroupMax(tmax);
+                } else {
+                    for (uint t = 0u; t < row_tile_n; t++)
+                        tmax = max(tmax, sh_w[r * TILE + t]);
+                }
                 float n = max(m[rr], tmax);
                 float rs = exp(m[rr] - n);
                 l[rr] *= rs;

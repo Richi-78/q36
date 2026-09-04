@@ -438,3 +438,51 @@ under those names).
 at 8k, ~quadratic as expected); MoE CM total ~11.8 s, dense Q8 ~9.2 s.
 Attention is now the prefill bottleneck at length. The GEMM family is done;
 `attn_prefill_qtile2`/`attn_combine` is the next kernel project.
+
+## 17. Prefill attention — subgroup-max tile reduction, +4% @2k / +21% @8k
+
+Roofline from the §16 8k profile: 10 full-attention layers (40 / interval 4),
+n_kv=2, K=Q8_0 (272 B/row/head), V=Q4_0 (144 B) → ~285 GB KV+Q+partials
+traffic in 40.68 s ≈ **7 GB/s** vs ~100 GB/s roof. Latency/occupancy-bound,
+not bandwidth-bound — headroom without changing a single byte.
+
+`vulkan/attn_prefill_qtile2.comp` (128 threads = 2 tokens × 8 GQA heads,
+64 lanes own 4 dims each, 64-key tiles, 4 barriers/tile) had every lane
+redundantly scan all 64 LDS scores per row for the online-softmax tile max:
+64 lanes × 64 reads for 64 values. Replaced with one element per lane +
+`subgroupMax` (new `GL_KHR_shader_subgroup_arithmetic` require; the 64 lanes
+of a row group are one wave64 subgroup; other subgroup sizes keep the serial
+scan). `max()` on finite values is order-independent → bit-identical.
+
+| bench (CM on) | before | after | delta |
+|---|---:|---:|---:|
+| 2048 ctx prefill | 326.65 | ~341 (337.6/342.2/344.7/344.3) | **+4.4%** |
+| 8192 ctx prefill | 200.58 | 243.4/244.3 | **+21%** |
+| qtile2 @2k | 2166 ms | 1605 ms | 1.35x |
+| qtile2 @8k | 40681 ms | 26202 ms | 1.55x |
+
+Generation unchanged (~24.4 t/s; decode doesn't use this kernel).
+
+### Correctness
+
+- Greedy CLI (`--temp 0 -n 20`, `long_memory_archive.txt`, CM on):
+  byte-identical vs pre-change shader.
+- `./q36_test --vulkan-kernels`: OK. `--session-sync-resume`: OK exact.
+- `--vulkan-fusion-parity`: OK (top1 match, rms ~1.1e-5).
+
+### Negative probes (reverted, not kept)
+
+- **Exp-fusion** (fold `exp(w-nm)` into AV loop, drop 1 barrier + 1 LDS
+  pass): prefill 326.7 → 321.8, kernel 2166 → 2328 ms. The 64x extra
+  transcendentals (512 vs 8 exp/lane) cost more than the barrier saved.
+  Kernel is ALU-heavy already (Q8/Q4 dequant) — don't add exp.
+- **TILE 64→128** (halve barriers/tile, LDS 20→24 KB): 2k and 8k both
+  inside noise (kernel 25.6 s vs 26.2 s @8k). Barrier count is not the
+  binding constraint; kept 64 for the smaller LDS footprint.
+
+### Note
+
+Mid-experiment the tree briefly lost `l[rr] += w;` through a bad hunk
+(fused-test binary was invalid, timing only). Restored and verified via
+`git diff` clean + rebuild + greedy-diff before measuring. Lesson: attention
+edits get a greedy-diff before any number is trusted.
